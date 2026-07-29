@@ -26,6 +26,7 @@ type resolvedGRPCRouteDetails struct {
 	grpcRoute        gatewayv1.GRPCRoute
 	matchedRef       gatewayv1.ParentReference
 	matchedListeners []gatewayv1.Listener
+	attachmentDenied bool
 }
 
 type resolveGRPCBackendRefsParams struct {
@@ -40,9 +41,7 @@ type programGRPCRouteParams struct {
 	matchedListeners []gatewayv1.Listener
 }
 
-type programGRPCRouteResult struct {
-	programmedPolicyRules []string
-}
+type programGRPCRouteResult = programRouteResult
 
 type ensureGRPCListenersProtocolParams struct {
 	config           types.GatewayConfig
@@ -59,16 +58,18 @@ type setGRPCRouteProgrammedParams struct {
 	grpcRoute    gatewayv1.GRPCRoute
 	gatewayClass gatewayv1.GatewayClass
 	gateway      gatewayv1.Gateway
+	config       types.GatewayConfig
 	matchedRef   gatewayv1.ParentReference
 
 	programmedPolicyRules []string
+	programmedBackendSets []string
 }
 
 type grpcRouteModel interface {
 	resolveRequest(
 		ctx context.Context,
 		req reconcile.Request,
-	) (map[apitypes.NamespacedName]resolvedGRPCRouteDetails, error)
+	) (map[routeParentResultKey]resolvedGRPCRouteDetails, error)
 
 	acceptRoute(
 		ctx context.Context,
@@ -142,16 +143,8 @@ func (m *grpcRouteModelImpl) resolveRouteParentRefData(
 	grpcRoute gatewayv1.GRPCRoute,
 	parentRef gatewayv1.ParentReference,
 	defaultNamespace string,
-) (*resolvedGatewayDetails, []gatewayv1.Listener, error) {
-	var resolvedGatewayData resolvedGatewayDetails
-	gatewayNamespace := defaultNamespace
-	if parentRef.Namespace != nil {
-		gatewayNamespace = string(lo.FromPtr(parentRef.Namespace))
-	}
-	parentName := apitypes.NamespacedName{
-		Namespace: gatewayNamespace,
-		Name:      string(parentRef.Name),
-	}
+) (*resolvedGatewayDetails, []gatewayv1.Listener, bool, error) {
+	parentName := parentRefTargetName(parentRef, defaultNamespace)
 	m.logger.DebugContext(ctx, "Resolving parent for GRPCRoute",
 		slog.String("parentName", parentName.String()),
 		slog.Any("parentRef", parentRef),
@@ -161,38 +154,73 @@ func (m *grpcRouteModelImpl) resolveRouteParentRefData(
 		}.String()),
 	)
 
-	gatewayResolved, err := m.gatewayModel.resolveReconcileRequest(ctx, reconcile.Request{
-		NamespacedName: parentName,
-	}, &resolvedGatewayData)
+	resolvedGatewayData, gatewayResolved, err := resolveL7ParentGateway(
+		ctx,
+		m.client,
+		m.gatewayModel,
+		parentRef,
+		defaultNamespace,
+	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to resolve gateway %s for route %s/%s: %w",
+		return nil, nil, false, fmt.Errorf("failed to resolve gateway %s for route %s/%s: %w",
 			parentName.String(), grpcRoute.Namespace, grpcRoute.Name, err)
 	}
 	if !gatewayResolved {
-		return nil, nil, nil
+		return nil, nil, false, nil
 	}
 
 	if parentRef.SectionName != nil {
 		sectionName := *parentRef.SectionName
-		matchingListeners := lo.Filter(
-			resolvedGatewayData.gateway.Spec.Listeners,
-			func(listener gatewayv1.Listener, _ int) bool {
-				return listener.Name == sectionName && grpcRouteListenerProtocolSupported(listener.Protocol)
+		matchingListeners := effectiveListenersForParentRef(
+			resolvedGatewayData,
+			parentRef,
+			defaultNamespace,
+			func(ref gatewayv1.ParentReference, listener gatewayv1.Listener) bool {
+				return ref.SectionName != nil &&
+					listener.Name == sectionName &&
+					grpcRouteListenerProtocolSupported(listener.Protocol)
 			},
 		)
 		if len(matchingListeners) == 0 {
-			return nil, nil, nil
+			return nil, nil, false, nil
 		}
-		return &resolvedGatewayData, matchingListeners, nil
+		allowedListeners, allowErr := allowedRouteListeners(
+			ctx,
+			m.client,
+			resolvedGatewayData,
+			grpcRoute.Namespace,
+			matchingListeners,
+			"GRPCRoute",
+		)
+		if allowErr != nil {
+			return nil, nil, false, allowErr
+		}
+		return &resolvedGatewayData, allowedListeners, len(allowedListeners) == 0, nil
 	}
 
-	matchingListeners := lo.Filter(
-		resolvedGatewayData.gateway.Spec.Listeners,
-		func(listener gatewayv1.Listener, _ int) bool {
+	matchingListeners := effectiveListenersForParentRef(
+		resolvedGatewayData,
+		parentRef,
+		defaultNamespace,
+		func(_ gatewayv1.ParentReference, listener gatewayv1.Listener) bool {
 			return grpcRouteListenerProtocolSupported(listener.Protocol)
 		},
 	)
-	return &resolvedGatewayData, matchingListeners, nil
+	if len(matchingListeners) == 0 {
+		return nil, nil, false, nil
+	}
+	allowedListeners, allowErr := allowedRouteListeners(
+		ctx,
+		m.client,
+		resolvedGatewayData,
+		grpcRoute.Namespace,
+		matchingListeners,
+		"GRPCRoute",
+	)
+	if allowErr != nil {
+		return nil, nil, false, allowErr
+	}
+	return &resolvedGatewayData, allowedListeners, len(allowedListeners) == 0, nil
 }
 
 func grpcRouteListenerProtocolSupported(protocol gatewayv1.ProtocolType) bool {
@@ -201,16 +229,14 @@ func grpcRouteListenerProtocolSupported(protocol gatewayv1.ProtocolType) bool {
 
 func (m *grpcRouteModelImpl) aggregateRouteParentRefData(
 	ctx context.Context,
-	results map[apitypes.NamespacedName]resolvedGRPCRouteDetails,
+	results map[routeParentResultKey]resolvedGRPCRouteDetails,
 	grpcRoute gatewayv1.GRPCRoute,
 	gatewayDetails resolvedGatewayDetails,
 	matchedRef gatewayv1.ParentReference,
 	matchedListeners []gatewayv1.Listener,
+	attachmentDenied bool,
 ) {
-	parentName := apitypes.NamespacedName{
-		Namespace: gatewayDetails.gateway.Namespace,
-		Name:      gatewayDetails.gateway.Name,
-	}
+	parentName := directParentResultKey(matchedRef, grpcRoute.Namespace)
 
 	if existingResult, found := results[parentName]; found {
 		existingResult.matchedListeners = lo.UniqBy(
@@ -219,6 +245,7 @@ func (m *grpcRouteModelImpl) aggregateRouteParentRefData(
 				return listener.Name
 			},
 		)
+		existingResult.attachmentDenied = existingResult.attachmentDenied && attachmentDenied
 		results[parentName] = existingResult
 		m.logger.DebugContext(ctx, "Appended/merged listeners for existing GRPCRoute gateway result",
 			slog.String("parentName", parentName.String()),
@@ -232,24 +259,25 @@ func (m *grpcRouteModelImpl) aggregateRouteParentRefData(
 		gatewayDetails:   gatewayDetails,
 		matchedRef:       matchedRef,
 		matchedListeners: matchedListeners,
+		attachmentDenied: attachmentDenied,
 	}
 }
 
 func (m *grpcRouteModelImpl) resolveRequest(
 	ctx context.Context,
 	req reconcile.Request,
-) (map[apitypes.NamespacedName]resolvedGRPCRouteDetails, error) {
+) (map[routeParentResultKey]resolvedGRPCRouteDetails, error) {
 	var grpcRoute gatewayv1.GRPCRoute
 	if err := m.client.Get(ctx, req.NamespacedName, &grpcRoute); err != nil {
 		if apierrors.IsNotFound(err) {
-			return map[apitypes.NamespacedName]resolvedGRPCRouteDetails{}, nil
+			return map[routeParentResultKey]resolvedGRPCRouteDetails{}, nil
 		}
 		return nil, fmt.Errorf("failed to get GRPCRoute %s: %w", req.NamespacedName.String(), err)
 	}
 
-	results := make(map[apitypes.NamespacedName]resolvedGRPCRouteDetails)
+	results := make(map[routeParentResultKey]resolvedGRPCRouteDetails)
 	for _, parentRef := range grpcRoute.Spec.ParentRefs {
-		resolvedGatewayData, matchedListeners, err := m.resolveRouteParentRefData(
+		resolvedGatewayData, matchedListeners, attachmentDenied, err := m.resolveRouteParentRefData(
 			ctx,
 			grpcRoute,
 			parentRef,
@@ -266,7 +294,15 @@ func (m *grpcRouteModelImpl) resolveRequest(
 				*resolvedGatewayData,
 				makeTargetOnlyParentRef(parentRef),
 				matchedListeners,
+				attachmentDenied,
 			)
+		}
+	}
+
+	if len(results) == 0 && grpcRoute.DeletionTimestamp != nil &&
+		controllerutil.ContainsFinalizer(&grpcRoute, GRPCRouteProgrammedFinalizer) {
+		if err := m.deprovisionDetachedRoute(ctx, grpcRoute); err != nil {
+			return nil, fmt.Errorf("failed to deprovision detached GRPCRoute %s: %w", req.NamespacedName, err)
 		}
 	}
 
@@ -277,9 +313,18 @@ func (m *grpcRouteModelImpl) acceptRoute(
 	ctx context.Context,
 	routeDetails resolvedGRPCRouteDetails,
 ) (*gatewayv1.GRPCRoute, error) {
+	if routeDetails.attachmentDenied {
+		return nil, m.rejectRoute(ctx, routeDetails, fmt.Sprintf(
+			"matched listeners do not allow GRPCRoute %s/%s",
+			routeDetails.grpcRoute.Namespace,
+			routeDetails.grpcRoute.Name,
+		))
+	}
+
 	winner, conflicted, err := checkL7RouteConflict(ctx, checkL7RouteConflictParams{
-		gateway:          routeDetails.gatewayDetails.gateway,
-		matchedListeners: routeDetails.matchedListeners,
+		gateway:            routeDetails.gatewayDetails.gateway,
+		effectiveListeners: routeDetails.gatewayDetails.effectiveListeners,
+		matchedListeners:   routeDetails.matchedListeners,
 		current: l7RouteCandidate{
 			identity: l7RouteIdentity{
 				kind:              l7GRPCRouteKind,
@@ -436,40 +481,26 @@ func (m *grpcRouteModelImpl) programRoute(
 	ctx context.Context,
 	params programGRPCRouteParams,
 ) (programGRPCRouteResult, error) {
-	var previousRules []programmedHTTPRoutePolicyRule
-	if prevPolicyRulesStr, ok := params.grpcRoute.Annotations[GRPCRouteProgrammedPolicyRulesAnnotation]; ok {
-		previousRules = parseProgrammedHTTPRoutePolicyRules(prevPolicyRulesStr)
-	}
-
-	routePolicyParams := programL7RoutePolicyParams{
-		loadBalancerID:      params.config.Spec.LoadBalancerID,
-		gateway:             params.gateway,
-		config:              params.config,
-		routeName:           params.grpcRoute.Name,
-		routeNamespace:      params.grpcRoute.Namespace,
-		backendRefs:         grpcRouteBackendRefs(params.grpcRoute),
-		knownBackends:       params.knownBackends,
-		matchedListeners:    params.matchedListeners,
-		previousPolicyRules: previousRules,
-		backendTLSPolicy:    m.backendTLSPolicy,
-		backendTLSDisabled:  m.backendTLSDisabled,
-		ruleCount:           len(params.grpcRoute.Spec.Rules),
+	return programL7RouteResult(ctx, m.ociLoadBalancerModel, programL7RouteParams{
+		route:                 &params.grpcRoute,
+		loadBalancerID:        params.config.Spec.LoadBalancerID,
+		gateway:               params.gateway,
+		config:                params.config,
+		backendRefs:           grpcRouteBackendRefs(params.grpcRoute),
+		knownBackends:         params.knownBackends,
+		matchedListeners:      params.matchedListeners,
+		backendTLSPolicy:      m.backendTLSPolicy,
+		backendTLSDisabled:    m.backendTLSDisabled,
+		ruleCount:             len(params.grpcRoute.Spec.Rules),
+		policyRulesAnnotation: GRPCRouteProgrammedPolicyRulesAnnotation,
+		backendSetsAnnotation: GRPCRouteProgrammedBackendSetsAnnotation,
 		makeRoutingRule: func(ruleIndex int) (loadbalancer.RoutingRule, error) {
 			return m.ociLoadBalancerModel.makeGRPCRoutingRule(ctx, makeGRPCRoutingRuleParams{
 				grpcRoute:          params.grpcRoute,
 				grpcRouteRuleIndex: ruleIndex,
 			})
 		},
-	}
-
-	programmedPolicyRules, err := programL7RoutePolicy(ctx, m.ociLoadBalancerModel, routePolicyParams)
-	if err != nil {
-		return programGRPCRouteResult{}, err
-	}
-
-	return programGRPCRouteResult{
-		programmedPolicyRules: programmedPolicyRules,
-	}, nil
+	})
 }
 
 func (m *grpcRouteModelImpl) ensureGRPCListenersProtocol(
@@ -559,6 +590,39 @@ func (m *grpcRouteModelImpl) deprovisionRoute(
 	return nil
 }
 
+func (m *grpcRouteModelImpl) deprovisionDetachedRoute(
+	ctx context.Context,
+	grpcRoute gatewayv1.GRPCRoute,
+) error {
+	return deprovisionDetachedL7Route(ctx, m.ociLoadBalancerModel, deprovisionDetachedL7RouteParams{
+		route:                 &grpcRoute,
+		routeKind:             "GRPCRoute",
+		policyRulesAnnotation: GRPCRouteProgrammedPolicyRulesAnnotation,
+		loadBalancerID:        grpcRoute.Annotations[L7RouteProgrammedLoadBalancerIDAnnotation],
+		backendRefs:           grpcRouteBackendRefs(grpcRoute),
+		removeFinalizer: func(ctx context.Context) error {
+			return m.removeDetachedGRPCRouteFinalizer(ctx, grpcRoute)
+		},
+	})
+}
+
+func (m *grpcRouteModelImpl) removeDetachedGRPCRouteFinalizer(
+	ctx context.Context,
+	grpcRoute gatewayv1.GRPCRoute,
+) error {
+	routeToUpdate := grpcRoute.DeepCopy()
+	controllerutil.RemoveFinalizer(routeToUpdate, GRPCRouteProgrammedFinalizer)
+	if routeToUpdate.Annotations != nil {
+		delete(routeToUpdate.Annotations, GRPCRouteProgrammedPolicyRulesAnnotation)
+		delete(routeToUpdate.Annotations, L7RouteProgrammedLoadBalancerIDAnnotation)
+	}
+	if err := m.client.Update(ctx, routeToUpdate); err != nil {
+		return fmt.Errorf("failed to update detached GRPCRoute %s/%s after cleanup: %w",
+			routeToUpdate.Namespace, routeToUpdate.Name, err)
+	}
+	return nil
+}
+
 func (m *grpcRouteModelImpl) setRejected(
 	ctx context.Context,
 	routeDetails resolvedGRPCRouteDetails,
@@ -603,7 +667,8 @@ func (m *grpcRouteModelImpl) isProgrammingRequired(details resolvedGRPCRouteDeta
 		conditions:    parentStatus.Conditions,
 		conditionType: string(gatewayv1.RouteConditionResolvedRefs),
 		annotations: map[string]string{
-			GRPCRouteProgrammingRevisionAnnotation: GRPCRouteProgrammingRevisionValue,
+			GRPCRouteProgrammingRevisionAnnotation:    GRPCRouteProgrammingRevisionValue,
+			L7RouteProgrammedLoadBalancerIDAnnotation: details.gatewayDetails.config.Spec.LoadBalancerID,
 		},
 	})
 }
@@ -619,11 +684,14 @@ func (m *grpcRouteModelImpl) setProgrammed(
 		parentStatuses:        grpcRoute.Status.Parents,
 		gatewayClass:          params.gatewayClass,
 		gateway:               params.gateway,
+		loadBalancerID:        params.config.Spec.LoadBalancerID,
 		matchedRef:            params.matchedRef,
 		programmedPolicyRules: params.programmedPolicyRules,
+		programmedBackendSets: params.programmedBackendSets,
 		programmingAnnotation: GRPCRouteProgrammingRevisionAnnotation,
 		programmingRevision:   GRPCRouteProgrammingRevisionValue,
 		policyRulesAnnotation: GRPCRouteProgrammedPolicyRulesAnnotation,
+		backendSetsAnnotation: GRPCRouteProgrammedBackendSetsAnnotation,
 		finalizer:             GRPCRouteProgrammedFinalizer,
 	})
 	if err != nil {

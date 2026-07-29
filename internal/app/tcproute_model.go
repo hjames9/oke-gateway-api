@@ -85,14 +85,7 @@ func tcpRouteBackendRefName(backendRef gatewayv1.BackendRef, defaultNamespace st
 }
 
 func tcpParentRefTarget(parentRef gatewayv1.ParentReference, routeNamespace string) apitypes.NamespacedName {
-	namespace := routeNamespace
-	if parentRef.Namespace != nil {
-		namespace = string(*parentRef.Namespace)
-	}
-	return apitypes.NamespacedName{
-		Namespace: namespace,
-		Name:      string(parentRef.Name),
-	}
+	return parentRefTargetName(parentRef, routeNamespace)
 }
 
 func tcpRouteMatchesListener(parentRef gatewayv1.ParentReference, listener gatewayv1.Listener) bool {
@@ -119,14 +112,20 @@ func desiredTCPRouteBackendSetNames(details resolvedTCPRouteDetails) map[string]
 		Name:      details.gatewayDetails.gateway.Name,
 	}
 	for _, parentRef := range details.tcpRoute.Spec.ParentRefs {
-		if !parentRefTargetsGateway(parentRef) ||
+		if !parentRefTargetsGateway(parentRef) && !parentRefTargetsListenerSet(parentRef) {
+			continue
+		}
+		if parentRefTargetsGateway(parentRef) &&
 			tcpParentRefTarget(parentRef, details.tcpRoute.Namespace) != gatewayName {
 			continue
 		}
-		for _, listener := range details.gatewayDetails.gateway.Spec.Listeners {
-			if tcpRouteMatchesListener(parentRef, listener) {
-				desired[networkLoadBalancerBackendSetName(listener)] = struct{}{}
-			}
+		for _, listener := range effectiveListenersForParentRef(
+			details.gatewayDetails,
+			parentRef,
+			details.tcpRoute.Namespace,
+			tcpRouteMatchesListener,
+		) {
+			desired[networkLoadBalancerBackendSetName(listener)] = struct{}{}
 		}
 	}
 	return desired
@@ -186,20 +185,9 @@ func resolveL4RouteRequest[D any](
 
 	var results []D
 	for _, parentRef := range params.parentRefs() {
-		if !parentRefTargetsGateway(parentRef) {
-			continue
-		}
-		parentResults, resolved, err := params.resolveParentRef(parentRef)
+		parentResults, err := resolveL4RouteParentRef(params, parentRef)
 		if err != nil {
 			return nil, err
-		}
-		if !resolved {
-			continue
-		}
-		if len(parentResults) == 0 && params.route.GetDeletionTimestamp() == nil {
-			if err = params.rejectNoMatchingListener(parentRef); err != nil {
-				return nil, err
-			}
 		}
 		results = append(results, parentResults...)
 	}
@@ -210,6 +198,25 @@ func resolveL4RouteRequest[D any](
 		}
 	}
 	return results, nil
+}
+
+func resolveL4RouteParentRef[D any](
+	params resolveL4RouteRequestParams[D],
+	parentRef gatewayv1.ParentReference,
+) ([]D, error) {
+	if !parentRefTargetsGateway(parentRef) && !parentRefTargetsListenerSet(parentRef) {
+		return nil, nil
+	}
+	parentResults, resolved, err := params.resolveParentRef(parentRef)
+	if err != nil || !resolved {
+		return nil, err
+	}
+	if len(parentResults) == 0 && params.route.GetDeletionTimestamp() == nil {
+		if err = params.rejectNoMatchingListener(parentRef); err != nil {
+			return nil, err
+		}
+	}
+	return parentResults, nil
 }
 
 func (m *tcpRouteModelImpl) resolveParentRef(
@@ -223,10 +230,7 @@ func (m *tcpRouteModelImpl) resolveParentRef(
 	}
 
 	results := make([]resolvedTCPRouteDetails, 0)
-	for _, listener := range gatewayDetails.gateway.Spec.Listeners {
-		if !tcpRouteMatchesListener(parentRef, listener) {
-			continue
-		}
+	for _, listener := range effectiveListenersForParentRef(gatewayDetails, parentRef, route.Namespace, tcpRouteMatchesListener) {
 		results = append(results, resolvedTCPRouteDetails{
 			tcpRoute:        route,
 			gatewayDetails:  gatewayDetails,
@@ -242,7 +246,34 @@ func (m *tcpRouteModelImpl) resolveParentGateway(
 	routeNamespace string,
 	parentRef gatewayv1.ParentReference,
 ) (resolvedGatewayDetails, bool, error) {
-	return resolveL4ParentGateway(ctx, m.client, tcpParentRefTarget(parentRef, routeNamespace))
+	return resolveL4ParentGatewayForRouteParentRef(ctx, m.client, routeNamespace, parentRef)
+}
+
+func resolveL4ParentGatewayForRouteParentRef(
+	ctx context.Context,
+	k8sClient k8sClient,
+	routeNamespace string,
+	parentRef gatewayv1.ParentReference,
+) (resolvedGatewayDetails, bool, error) {
+	if parentRefTargetsGateway(parentRef) {
+		return resolveL4ParentGateway(ctx, k8sClient, parentRefTargetName(parentRef, routeNamespace))
+	}
+	if !parentRefTargetsListenerSet(parentRef) {
+		return resolvedGatewayDetails{}, false, nil
+	}
+
+	gatewayName, resolved, err := listenerSetParentGatewayTarget(ctx, k8sClient, routeNamespace, parentRef)
+	if err != nil || !resolved {
+		return resolvedGatewayDetails{}, resolved, err
+	}
+	details, resolved, err := resolveL4ParentGateway(ctx, k8sClient, gatewayName)
+	if err != nil || !resolved {
+		return details, resolved, err
+	}
+	if err = populateAttachedListenerSetsUnindexed(ctx, k8sClient, &details); err != nil {
+		return resolvedGatewayDetails{}, false, err
+	}
+	return details, true, nil
 }
 
 func resolveL4ParentGateway(
@@ -325,9 +356,6 @@ func (m *tcpRouteModelImpl) handleUnresolvedFinalizedRoute(
 	ctx context.Context,
 	route gatewayv1.TCPRoute,
 ) error {
-	if route.DeletionTimestamp != nil {
-		return m.removeDeletingRouteFinalizer(ctx, route)
-	}
 	return m.deprovisionDetachedRoute(ctx, route)
 }
 
@@ -338,6 +366,7 @@ func (m *tcpRouteModelImpl) removeDeletingRouteFinalizer(
 	routeToUpdate := route.DeepCopy()
 	controllerutil.RemoveFinalizer(routeToUpdate, NetworkLoadBalancerTCPRouteProgrammedFinalizer)
 	setAnnotatedBackendSetNames(routeToUpdate, NetworkLoadBalancerTCPRouteProgrammedBackendSetsAnnotation, nil)
+	delete(routeToUpdate.Annotations, L4RouteProgrammedNetworkLoadBalancerIDAnnotation)
 	if err := m.client.Update(ctx, routeToUpdate); err != nil {
 		return fmt.Errorf("failed to remove finalizer from deleting TCPRoute %s/%s: %w",
 			routeToUpdate.Namespace,
@@ -587,7 +616,7 @@ func (m *tcpRouteModelImpl) matchingRoutesForListener(
 		routeList:       &routeList,
 		listError:       listError,
 		items:           func() []gatewayv1.TCPRoute { return routeList.Items },
-		gatewayName:     client.ObjectKeyFromObject(&details.gatewayDetails.gateway),
+		gatewayDetails:  details.gatewayDetails,
 		listener:        details.matchedListener,
 		excludeRouteKey: excludeRouteKey,
 		routeKey:        tcpRouteKey,
@@ -595,7 +624,6 @@ func (m *tcpRouteModelImpl) matchingRoutesForListener(
 		routeCreatedAt:  func(route gatewayv1.TCPRoute) metav1.Time { return route.CreationTimestamp },
 		parentRefs:      func(route gatewayv1.TCPRoute) []gatewayv1.ParentReference { return route.Spec.ParentRefs },
 		routeDeleted:    func(route gatewayv1.TCPRoute) bool { return route.DeletionTimestamp != nil },
-		parentTarget:    tcpParentRefTarget,
 		matchesListener: tcpRouteMatchesListener,
 	})
 }
@@ -628,7 +656,7 @@ type l4RouteListenerMatch[T any] struct {
 
 func matchingL4RoutesForListener[T any](
 	routes []T,
-	gatewayName apitypes.NamespacedName,
+	gatewayDetails resolvedGatewayDetails,
 	listener gatewayv1.Listener,
 	excludeRouteKey string,
 	routeKey func(T) string,
@@ -636,7 +664,6 @@ func matchingL4RoutesForListener[T any](
 	routeCreatedAt func(T) metav1.Time,
 	parentRefs func(T) []gatewayv1.ParentReference,
 	routeDeleted func(T) bool,
-	parentTarget func(gatewayv1.ParentReference, string) apitypes.NamespacedName,
 	matchesListener func(gatewayv1.ParentReference, gatewayv1.Listener) bool,
 ) []l4RouteListenerMatch[T] {
 	matches := make([]l4RouteListenerMatch[T], 0)
@@ -646,13 +673,13 @@ func matchingL4RoutesForListener[T any](
 			continue
 		}
 		for _, parentRef := range parentRefs(route) {
-			if !parentRefTargetsGateway(parentRef) {
-				continue
-			}
-			if parentTarget(parentRef, routeNamespace(route)) != gatewayName {
-				continue
-			}
-			if matchesListener(parentRef, listener) {
+			if l4ParentRefMatchesListener(
+				gatewayDetails,
+				parentRef,
+				routeNamespace(route),
+				listener,
+				matchesListener,
+			) {
 				matches = append(matches, l4RouteListenerMatch[T]{
 					route:      route,
 					key:        key,
@@ -673,12 +700,39 @@ func matchingL4RoutesForListener[T any](
 	return matches
 }
 
+func l4ParentRefMatchesListener(
+	gatewayDetails resolvedGatewayDetails,
+	parentRef gatewayv1.ParentReference,
+	routeNamespace string,
+	listener gatewayv1.Listener,
+	matchesListener func(gatewayv1.ParentReference, gatewayv1.Listener) bool,
+) bool {
+	if !parentRefTargetsGateway(parentRef) && !parentRefTargetsListenerSet(parentRef) {
+		return false
+	}
+	matchedListeners := effectiveListenersForParentRef(
+		gatewayDetails,
+		parentRef,
+		routeNamespace,
+		matchesListener,
+	)
+	if parentRefTargetsGateway(parentRef) &&
+		len(matchedListeners) == 0 &&
+		parentRefTargetName(parentRef, routeNamespace) == client.ObjectKeyFromObject(&gatewayDetails.gateway) &&
+		matchesListener(parentRef, listener) {
+		matchedListeners = []gatewayv1.Listener{listener}
+	}
+	return lo.ContainsBy(matchedListeners, func(matched gatewayv1.Listener) bool {
+		return matched.Name == listener.Name
+	})
+}
+
 type listMatchingL4RoutesForListenerParams[T any] struct {
 	k8sClient       k8sClient
 	routeList       client.ObjectList
 	listError       string
 	items           func() []T
-	gatewayName     apitypes.NamespacedName
+	gatewayDetails  resolvedGatewayDetails
 	listener        gatewayv1.Listener
 	excludeRouteKey string
 	routeKey        func(T) string
@@ -686,7 +740,6 @@ type listMatchingL4RoutesForListenerParams[T any] struct {
 	routeCreatedAt  func(T) metav1.Time
 	parentRefs      func(T) []gatewayv1.ParentReference
 	routeDeleted    func(T) bool
-	parentTarget    func(gatewayv1.ParentReference, string) apitypes.NamespacedName
 	matchesListener func(gatewayv1.ParentReference, gatewayv1.Listener) bool
 }
 
@@ -699,7 +752,7 @@ func listMatchingL4RoutesForListener[T any](
 	}
 	return matchingL4RoutesForListener(
 		params.items(),
-		params.gatewayName,
+		params.gatewayDetails,
 		params.listener,
 		params.excludeRouteKey,
 		params.routeKey,
@@ -707,7 +760,6 @@ func listMatchingL4RoutesForListener[T any](
 		params.routeCreatedAt,
 		params.parentRefs,
 		params.routeDeleted,
-		params.parentTarget,
 		params.matchesListener,
 	), nil
 }
@@ -843,15 +895,18 @@ func (m *tcpRouteModelImpl) programRouteParams(
 	details resolvedTCPRouteDetails,
 ) programL4RouteParams {
 	return newProgramL4RouteParams(newProgramL4RouteParamsInput{
-		k8sClient:        m.client,
-		routeKind:        "TCPRoute",
-		route:            &details.tcpRoute,
-		gatewayNamespace: details.gatewayDetails.gateway.Namespace,
-		listener:         details.matchedListener,
-		finalizer:        NetworkLoadBalancerTCPRouteProgrammedFinalizer,
-		clearBackendSet:  func() error { return m.clearBackendSet(ctx, details) },
-		ensureOwner:      func() error { return m.ensureExclusiveListenerOwner(ctx, details) },
-		clearStale:       func() error { return m.clearStaleBackendSets(ctx, details) },
+		k8sClient: m.client,
+		routeKind: "TCPRoute",
+		route:     &details.tcpRoute,
+		listenerNamespace: effectiveListenerSourceNamespaceForOCIListener(
+			details.gatewayDetails,
+			details.matchedListener,
+		),
+		listener:        details.matchedListener,
+		finalizer:       NetworkLoadBalancerTCPRouteProgrammedFinalizer,
+		clearBackendSet: func() error { return m.clearBackendSet(ctx, details) },
+		ensureOwner:     func() error { return m.ensureExclusiveListenerOwner(ctx, details) },
+		clearStale:      func() error { return m.clearStaleBackendSets(ctx, details) },
 		resolveBackends: func() ([]networkloadbalancer.BackendDetails, error) {
 			return m.endpointBackendsForRoute(ctx, details.tcpRoute)
 		},
@@ -872,7 +927,7 @@ type newProgramL4RouteParamsInput struct {
 	k8sClient           k8sClient
 	routeKind           gatewayv1.Kind
 	route               client.Object
-	gatewayNamespace    string
+	listenerNamespace   string
 	listener            gatewayv1.Listener
 	finalizer           string
 	clearBackendSet     func() error
@@ -889,7 +944,7 @@ func newProgramL4RouteParams(input newProgramL4RouteParamsInput) programL4RouteP
 		k8sClient:                    input.k8sClient,
 		routeKind:                    input.routeKind,
 		route:                        input.route,
-		gatewayNamespace:             input.gatewayNamespace,
+		listenerNamespace:            input.listenerNamespace,
 		listener:                     input.listener,
 		finalizer:                    input.finalizer,
 		clearBackendSet:              input.clearBackendSet,
@@ -906,7 +961,7 @@ type programL4RouteParams struct {
 	k8sClient                    k8sClient
 	routeKind                    gatewayv1.Kind
 	route                        client.Object
-	gatewayNamespace             string
+	listenerNamespace            string
 	listener                     gatewayv1.Listener
 	finalizer                    string
 	clearBackendSet              func() error
@@ -922,7 +977,7 @@ func programL4Route(ctx context.Context, params programL4RouteParams) error {
 	allowed, err := l4ListenerAllowsRoute(
 		ctx,
 		params.k8sClient,
-		params.gatewayNamespace,
+		params.listenerNamespace,
 		params.route.GetNamespace(),
 		params.listener,
 		params.routeKind,
@@ -1092,6 +1147,7 @@ func deprovisionL4Route[D any](ctx context.Context, params deprovisionL4RoutePar
 
 	controllerutil.RemoveFinalizer(params.routeToUpdate, params.finalizer)
 	setAnnotatedBackendSetNames(params.routeToUpdate, params.backendSetAnnotKey, nil)
+	delete(params.routeToUpdate.GetAnnotations(), L4RouteProgrammedNetworkLoadBalancerIDAnnotation)
 	if err = params.k8sClient.Update(ctx, params.routeToUpdate); err != nil {
 		return fmt.Errorf("failed to remove finalizer from %s %s/%s: %w",
 			params.routeKind,
@@ -1125,6 +1181,14 @@ func (m *tcpRouteModelImpl) deprovisionDetachedRoute(
 		}
 	}
 
+	cleaned, err := m.cleanupDetachedRouteByAnnotatedNetworkLoadBalancer(ctx, route, programmedBackendSets)
+	if err != nil || cleaned {
+		return err
+	}
+	if route.DeletionTimestamp != nil {
+		return m.removeDeletingRouteFinalizer(ctx, route)
+	}
+
 	return nil
 }
 
@@ -1148,7 +1212,41 @@ func (m *tcpRouteModelImpl) cleanupDetachedRouteParent(
 	routeToUpdate := route.DeepCopy()
 	controllerutil.RemoveFinalizer(routeToUpdate, NetworkLoadBalancerTCPRouteProgrammedFinalizer)
 	setAnnotatedBackendSetNames(routeToUpdate, NetworkLoadBalancerTCPRouteProgrammedBackendSetsAnnotation, nil)
+	delete(routeToUpdate.Annotations, L4RouteProgrammedNetworkLoadBalancerIDAnnotation)
 	if err = m.client.Update(ctx, routeToUpdate); err != nil {
+		return false, fmt.Errorf("failed to update detached TCPRoute %s/%s after cleanup: %w",
+			routeToUpdate.Namespace,
+			routeToUpdate.Name,
+			err,
+		)
+	}
+	return true, nil
+}
+
+func (m *tcpRouteModelImpl) cleanupDetachedRouteByAnnotatedNetworkLoadBalancer(
+	ctx context.Context,
+	route gatewayv1.TCPRoute,
+	programmedBackendSets map[string]struct{},
+) (bool, error) {
+	nlbID := route.Annotations[L4RouteProgrammedNetworkLoadBalancerIDAnnotation]
+	if nlbID == "" {
+		return false, nil
+	}
+
+	gatewayDetails := resolvedGatewayDetails{
+		config: types.GatewayConfig{Spec: types.GatewayConfigSpec{LoadBalancerID: nlbID}},
+	}
+	for backendSetName := range programmedBackendSets {
+		if err := m.clearBackendSetByName(ctx, gatewayDetails, tcpRouteKey(route), backendSetName, nil); err != nil {
+			return false, err
+		}
+	}
+
+	routeToUpdate := route.DeepCopy()
+	controllerutil.RemoveFinalizer(routeToUpdate, NetworkLoadBalancerTCPRouteProgrammedFinalizer)
+	setAnnotatedBackendSetNames(routeToUpdate, NetworkLoadBalancerTCPRouteProgrammedBackendSetsAnnotation, nil)
+	delete(routeToUpdate.Annotations, L4RouteProgrammedNetworkLoadBalancerIDAnnotation)
+	if err := m.client.Update(ctx, routeToUpdate); err != nil {
 		return false, fmt.Errorf("failed to update detached TCPRoute %s/%s after cleanup: %w",
 			routeToUpdate.Namespace,
 			routeToUpdate.Name,
@@ -1233,6 +1331,7 @@ func (m *tcpRouteModelImpl) removeDetachedRouteFinalizer(
 ) error {
 	routeToUpdate := route.DeepCopy()
 	controllerutil.RemoveFinalizer(routeToUpdate, NetworkLoadBalancerTCPRouteProgrammedFinalizer)
+	delete(routeToUpdate.Annotations, L4RouteProgrammedNetworkLoadBalancerIDAnnotation)
 	if err := m.client.Update(ctx, routeToUpdate); err != nil {
 		return fmt.Errorf("failed to remove finalizer from detached TCPRoute %s/%s: %w",
 			routeToUpdate.Namespace,
@@ -1295,6 +1394,7 @@ func (m *tcpRouteModelImpl) setProgrammed(ctx context.Context, details resolvedT
 		routeToUpdate:      routeToUpdate,
 		finalizer:          NetworkLoadBalancerTCPRouteProgrammedFinalizer,
 		backendSetAnnotKey: NetworkLoadBalancerTCPRouteProgrammedBackendSetsAnnotation,
+		loadBalancerID:     details.gatewayDetails.config.Spec.LoadBalancerID,
 		desiredBackendSets: desiredTCPRouteBackendSetNames(details),
 		updateParentStatus: func(conditions []metav1.Condition) error {
 			return m.updateParentStatus(ctx, resolvedTCPRouteDetails{
@@ -1314,6 +1414,7 @@ type setL4RouteProgrammedParams struct {
 	routeToUpdate      client.Object
 	finalizer          string
 	backendSetAnnotKey string
+	loadBalancerID     string
 	desiredBackendSets map[string]struct{}
 	updateParentStatus func([]metav1.Condition) error
 }
@@ -1322,6 +1423,16 @@ func setL4RouteProgrammed(ctx context.Context, params setL4RouteProgrammedParams
 	needsUpdate := controllerutil.AddFinalizer(params.routeToUpdate, params.finalizer)
 	if len(params.desiredBackendSets) > 0 {
 		setAnnotatedBackendSetNames(params.routeToUpdate, params.backendSetAnnotKey, params.desiredBackendSets)
+		needsUpdate = true
+	}
+	if params.loadBalancerID != "" &&
+		params.routeToUpdate.GetAnnotations()[L4RouteProgrammedNetworkLoadBalancerIDAnnotation] != params.loadBalancerID {
+		annotations := params.routeToUpdate.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		annotations[L4RouteProgrammedNetworkLoadBalancerIDAnnotation] = params.loadBalancerID
+		params.routeToUpdate.SetAnnotations(annotations)
 		needsUpdate = true
 	}
 	if needsUpdate {

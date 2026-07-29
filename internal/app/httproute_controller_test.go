@@ -77,8 +77,8 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return(map[types.NamespacedName]resolvedRouteDetails{
-				req.NamespacedName: wantResolvedData,
+			).Return(map[routeParentResultKey]resolvedRouteDetails{
+				gatewayParentResultKey(req.NamespacedName): wantResolvedData,
 			}, (error)(nil))
 
 			mockModel.EXPECT().isProgrammingRequired(wantResolvedData).Return(true, nil)
@@ -120,6 +120,7 @@ func TestHTTPRouteController(t *testing.T) {
 				setProgrammedParams{
 					gatewayClass:          wantResolvedData.gatewayDetails.gatewayClass,
 					gateway:               wantResolvedData.gatewayDetails.gateway,
+					config:                wantResolvedData.gatewayDetails.config,
 					httpRoute:             wantAcceptedRoute,
 					matchedRef:            wantResolvedData.matchedRef,
 					programmedPolicyRules: programmedPolicyRules,
@@ -157,12 +158,47 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return(map[types.NamespacedName]resolvedRouteDetails{}, (error)(nil))
+			).Return(map[routeParentResultKey]resolvedRouteDetails{}, (error)(nil))
 
 			result, err := controller.Reconcile(t.Context(), req)
 
 			require.NoError(t, err)
 			assert.Equal(t, reconcile.Result{}, result)
+		})
+
+		t.Run("skips programming when accept returns nil", func(t *testing.T) {
+			fake := faker.New()
+			deps := newMockDeps(t)
+			controller := NewHTTPRouteController(deps)
+			req := reconcile.Request{
+				NamespacedName: client.ObjectKey{
+					Namespace: fake.Internet().Domain(),
+					Name:      fake.Lorem().Word(),
+				},
+			}
+			resolvedData := resolvedRouteDetails{
+				httpRoute: makeRandomHTTPRoute(),
+				gatewayDetails: resolvedGatewayDetails{
+					gateway: *newRandomGateway(),
+					config:  makeRandomGatewayConfig(),
+				},
+			}
+
+			mockModel, _ := deps.HTTPRouteModel.(*MockhttpRouteModel)
+			mockModel.EXPECT().resolveRequest(
+				t.Context(),
+				req,
+			).Return(map[routeParentResultKey]resolvedRouteDetails{
+				gatewayParentResultKey(req.NamespacedName): resolvedData,
+			}, (error)(nil))
+			mockModel.EXPECT().acceptRoute(t.Context(), resolvedData).Return(nil, nil)
+
+			result, err := controller.Reconcile(t.Context(), req)
+
+			require.NoError(t, err)
+			assert.Equal(t, reconcile.Result{}, result)
+			mockModel.AssertNotCalled(t, "isProgrammingRequired", mock.Anything)
+			mockModel.AssertNotCalled(t, "programRoute", mock.Anything, mock.Anything)
 		})
 
 		t.Run("RelevantRouteDeleted", func(t *testing.T) {
@@ -193,8 +229,8 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return(map[types.NamespacedName]resolvedRouteDetails{
-				req.NamespacedName: wantResolvedData,
+			).Return(map[routeParentResultKey]resolvedRouteDetails{
+				gatewayParentResultKey(req.NamespacedName): wantResolvedData,
 			}, (error)(nil))
 
 			mockModel.EXPECT().deprovisionRoute(
@@ -237,7 +273,7 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return((map[types.NamespacedName]resolvedRouteDetails)(nil), wantErr)
+			).Return((map[routeParentResultKey]resolvedRouteDetails)(nil), wantErr)
 
 			result, err := controller.Reconcile(t.Context(), req)
 
@@ -269,8 +305,8 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return(map[types.NamespacedName]resolvedRouteDetails{
-				req.NamespacedName: wantResolvedData,
+			).Return(map[routeParentResultKey]resolvedRouteDetails{
+				gatewayParentResultKey(req.NamespacedName): wantResolvedData,
 			}, (error)(nil))
 
 			wantErr := fmt.Errorf("accept error: %s", fake.Lorem().Sentence(10))
@@ -309,8 +345,8 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return(map[types.NamespacedName]resolvedRouteDetails{
-				req.NamespacedName: wantResolvedData,
+			).Return(map[routeParentResultKey]resolvedRouteDetails{
+				gatewayParentResultKey(req.NamespacedName): wantResolvedData,
 			}, (error)(nil))
 
 			mockModel.EXPECT().isProgrammingRequired(wantResolvedData).Return(true, nil)
@@ -369,8 +405,8 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return(map[types.NamespacedName]resolvedRouteDetails{
-				req.NamespacedName: wantResolvedData,
+			).Return(map[routeParentResultKey]resolvedRouteDetails{
+				gatewayParentResultKey(req.NamespacedName): wantResolvedData,
 			}, (error)(nil))
 
 			mockModel.EXPECT().isProgrammingRequired(wantResolvedData).Return(true, nil)
@@ -429,8 +465,8 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return(map[types.NamespacedName]resolvedRouteDetails{
-				req.NamespacedName: wantResolvedData,
+			).Return(map[routeParentResultKey]resolvedRouteDetails{
+				gatewayParentResultKey(req.NamespacedName): wantResolvedData,
 			}, (error)(nil))
 
 			wantAcceptedRoute := makeRandomHTTPRoute()
@@ -485,8 +521,8 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return(map[types.NamespacedName]resolvedRouteDetails{
-				req.NamespacedName: wantResolvedData,
+			).Return(map[routeParentResultKey]resolvedRouteDetails{
+				gatewayParentResultKey(req.NamespacedName): wantResolvedData,
 			}, (error)(nil))
 
 			wantAcceptedRoute := makeRandomHTTPRoute()
@@ -534,6 +570,7 @@ func TestHTTPRouteController(t *testing.T) {
 				setProgrammedParams{
 					gatewayClass:          wantResolvedData.gatewayDetails.gatewayClass,
 					gateway:               wantResolvedData.gatewayDetails.gateway,
+					config:                wantResolvedData.gatewayDetails.config,
 					httpRoute:             wantAcceptedRoute,
 					matchedRef:            wantResolvedData.matchedRef,
 					programmedPolicyRules: programmedPolicyRules,
@@ -589,8 +626,8 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return(map[types.NamespacedName]resolvedRouteDetails{
-				req.NamespacedName: wantResolvedData,
+			).Return(map[routeParentResultKey]resolvedRouteDetails{
+				gatewayParentResultKey(req.NamespacedName): wantResolvedData,
 			}, (error)(nil))
 
 			mockModel.EXPECT().isProgrammingRequired(wantResolvedData).Return(true, nil)
@@ -625,6 +662,7 @@ func TestHTTPRouteController(t *testing.T) {
 				setProgrammedParams{
 					gatewayClass: wantResolvedData.gatewayDetails.gatewayClass,
 					gateway:      wantResolvedData.gatewayDetails.gateway,
+					config:       wantResolvedData.gatewayDetails.config,
 					httpRoute:    wantAcceptedRoute,
 					matchedRef:   wantResolvedData.matchedRef,
 				},
@@ -660,8 +698,8 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return(map[types.NamespacedName]resolvedRouteDetails{
-				req.NamespacedName: wantResolvedData,
+			).Return(map[routeParentResultKey]resolvedRouteDetails{
+				gatewayParentResultKey(req.NamespacedName): wantResolvedData,
 			}, (error)(nil))
 
 			wantErr := fmt.Errorf("is programming required error: %s", fake.Lorem().Sentence(10))
@@ -697,8 +735,8 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return(map[types.NamespacedName]resolvedRouteDetails{
-				req.NamespacedName: wantResolvedData,
+			).Return(map[routeParentResultKey]resolvedRouteDetails{
+				gatewayParentResultKey(req.NamespacedName): wantResolvedData,
 			}, (error)(nil))
 
 			// Assume programming is not required to isolate the sync error
@@ -748,8 +786,8 @@ func TestHTTPRouteController(t *testing.T) {
 			mockModel.EXPECT().resolveRequest(
 				t.Context(),
 				req,
-			).Return(map[types.NamespacedName]resolvedRouteDetails{
-				req.NamespacedName: wantResolvedData,
+			).Return(map[routeParentResultKey]resolvedRouteDetails{
+				gatewayParentResultKey(req.NamespacedName): wantResolvedData,
 			}, (error)(nil))
 
 			wantErr := fmt.Errorf("deprovision error: %s", fake.Lorem().Sentence(10))
