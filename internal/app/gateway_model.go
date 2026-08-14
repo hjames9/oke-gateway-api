@@ -12,6 +12,7 @@ import (
 
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/loadbalancer"
+	"github.com/samber/lo"
 	"go.uber.org/dig"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -21,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"github.com/gemyago/oke-gateway-api/internal/types"
 )
@@ -97,6 +99,9 @@ type resolvedGatewayDetails struct {
 	// Map of secret full name to the secret object
 	// holds all secrets that are used by the gateway (mostly listeners certificates)
 	gatewaySecrets map[string]corev1.Secret
+
+	gatewayFrontendMTLSConfigMaps      map[string]corev1.ConfigMap
+	gatewayFrontendMTLSReferenceGrants map[string]gatewayv1beta1.ReferenceGrant
 
 	config types.GatewayConfig
 
@@ -204,10 +209,146 @@ func (m *gatewayModelImpl) resolveReconcileRequest(
 	if err := m.populateGatewaySecrets(ctx, receiver); err != nil {
 		return false, err
 	}
+	if err := m.populateGatewayFrontendMTLSDependencies(ctx, receiver); err != nil {
+		return false, err
+	}
 
 	// TODO: Make sure config is complete
 
 	return true, nil
+}
+
+func (m *gatewayModelImpl) populateGatewayFrontendMTLSDependencies(
+	ctx context.Context,
+	receiver *resolvedGatewayDetails,
+) error {
+	receiver.gatewayFrontendMTLSConfigMaps = make(map[string]corev1.ConfigMap)
+	receiver.gatewayFrontendMTLSReferenceGrants = make(map[string]gatewayv1beta1.ReferenceGrant)
+	refs := frontendMTLSConfigMapRefs(receiver.gateway)
+	if len(refs) == 0 {
+		return nil
+	}
+
+	listedGrantNamespaces := make(map[string]struct{})
+	for _, fullName := range refs {
+		if err := m.populateGatewayFrontendMTLSConfigMapDependency(ctx, receiver, fullName); err != nil {
+			return err
+		}
+		if frontendMTLSReferenceGrantsAlreadyListed(receiver.gateway, fullName, listedGrantNamespaces) {
+			continue
+		}
+		listedGrantNamespaces[fullName.Namespace] = struct{}{}
+		if err := m.populateGatewayFrontendMTLSReferenceGrantDependencies(
+			ctx,
+			receiver,
+			refs,
+			fullName.Namespace,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *gatewayModelImpl) populateGatewayFrontendMTLSConfigMapDependency(
+	ctx context.Context,
+	receiver *resolvedGatewayDetails,
+	fullName apitypes.NamespacedName,
+) error {
+	var configMap corev1.ConfigMap
+	if err := m.client.Get(ctx, fullName, &configMap); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get frontend mTLS ConfigMap %s: %w", fullName.String(), err)
+	}
+	receiver.gatewayFrontendMTLSConfigMaps[fullName.String()] = configMap
+	return nil
+}
+
+func frontendMTLSReferenceGrantsAlreadyListed(
+	gateway gatewayv1.Gateway,
+	fullName apitypes.NamespacedName,
+	listedGrantNamespaces map[string]struct{},
+) bool {
+	if fullName.Namespace == gateway.Namespace {
+		return true
+	}
+	_, listed := listedGrantNamespaces[fullName.Namespace]
+	return listed
+}
+
+func (m *gatewayModelImpl) populateGatewayFrontendMTLSReferenceGrantDependencies(
+	ctx context.Context,
+	receiver *resolvedGatewayDetails,
+	refs []apitypes.NamespacedName,
+	namespace string,
+) error {
+	var grants gatewayv1beta1.ReferenceGrantList
+	if err := m.client.List(ctx, &grants, client.InNamespace(namespace)); err != nil {
+		return fmt.Errorf(
+			"failed to list frontend mTLS ReferenceGrants in namespace %s: %w",
+			namespace,
+			err,
+		)
+	}
+	for _, grant := range grants.Items {
+		m.addGatewayFrontendMTLSReferenceGrantDependency(receiver, refs, grant)
+	}
+	return nil
+}
+
+func (m *gatewayModelImpl) addGatewayFrontendMTLSReferenceGrantDependency(
+	receiver *resolvedGatewayDetails,
+	refs []apitypes.NamespacedName,
+	grant gatewayv1beta1.ReferenceGrant,
+) {
+	if !referenceGrantHasMatchingFrom(grant, gatewayv1.Kind("Gateway"), receiver.gateway.Namespace) {
+		return
+	}
+	for _, ref := range refs {
+		if ref.Namespace != grant.Namespace {
+			continue
+		}
+		if referenceGrantHasMatchingCoreTo(grant, "ConfigMap", ref.Name) {
+			receiver.gatewayFrontendMTLSReferenceGrants[client.ObjectKeyFromObject(&grant).String()] = grant
+			return
+		}
+	}
+}
+
+func frontendMTLSConfigMapRefs(gateway gatewayv1.Gateway) []apitypes.NamespacedName {
+	if gateway.Spec.TLS == nil || gateway.Spec.TLS.Frontend == nil {
+		return nil
+	}
+	refsByKey := make(map[apitypes.NamespacedName]struct{})
+	addRefs := func(validation *gatewayv1.FrontendTLSValidation) {
+		if validation == nil {
+			return
+		}
+		for _, ref := range validation.CACertificateRefs {
+			if ref.Group != "" || ref.Kind != "ConfigMap" {
+				continue
+			}
+			refNamespace := gateway.Namespace
+			if ref.Namespace != nil {
+				refNamespace = string(*ref.Namespace)
+			}
+			refsByKey[apitypes.NamespacedName{
+				Namespace: refNamespace,
+				Name:      string(ref.Name),
+			}] = struct{}{}
+		}
+	}
+	addRefs(gateway.Spec.TLS.Frontend.Default.Validation)
+	for _, portConfig := range gateway.Spec.TLS.Frontend.PerPort {
+		addRefs(portConfig.TLS.Validation)
+	}
+	refs := lo.Keys(refsByKey)
+	sort.Slice(refs, func(i, j int) bool {
+		return refs[i].String() < refs[j].String()
+	})
+	return refs
 }
 
 func (m *gatewayModelImpl) populateGatewaySecrets(
@@ -497,28 +638,31 @@ func (m *gatewayModelImpl) programGateway(ctx context.Context, data *resolvedGat
 
 	gatewayListeners := effectiveOCIListenersForGateway(data)
 	gatewayManagedListeners := gatewayManagedOCIListenersForLoadBalancer(data)
-	reconcileListenersCertificatesResult, err := m.ociLoadBalancerModel.reconcileListenersCertificates(ctx,
-		reconcileListenersCertificatesParams{
-			loadBalancerID:    loadBalancerID,
-			gateway:           &data.gateway,
-			gatewayListeners:  gatewayListeners,
-			knownCertificates: response.LoadBalancer.Certificates,
-		})
+	reconcileListenersCertificatesResult, err := m.reconcileGatewayListenerCertificates(
+		ctx,
+		data,
+		gatewayListeners,
+		response.LoadBalancer,
+	)
 	if err != nil {
-		return fmt.Errorf("failed to reconcile listeners certificates: %w", err)
+		return err
 	}
 
 	for _, listener := range gatewayManagedListeners {
 		listenerName := string(listener.Name)
 
 		params := reconcileHTTPListenerParams{
-			loadBalancerID:        loadBalancerID,
-			knownListeners:        response.LoadBalancer.Listeners,
-			knownRoutingPolicies:  response.LoadBalancer.RoutingPolicies,
-			listenerCertificates:  reconcileListenersCertificatesResult.certificatesByListener[listenerName],
-			listenerCertificateID: reconcileListenersCertificatesResult.certificateIDsByListener[listenerName],
-			defaultBackendSetName: *defaultBackendSet.Name,
-			listenerSpec:          &listener,
+			loadBalancerID:            loadBalancerID,
+			loadBalancerCompartmentID: lo.FromPtr(response.LoadBalancer.CompartmentId),
+			knownListeners:            response.LoadBalancer.Listeners,
+			knownRoutingPolicies:      response.LoadBalancer.RoutingPolicies,
+			listenerCertificates:      reconcileListenersCertificatesResult.certificatesByListener[listenerName],
+			listenerCertificateID:     reconcileListenersCertificatesResult.certificateIDsByListener[listenerName],
+			defaultBackendSetName:     *defaultBackendSet.Name,
+			listenerSpec:              &listener,
+		}
+		if gatewayFrontendMTLSConfigured(data.gateway) {
+			params.gateway = &data.gateway
 		}
 
 		if err = m.ociLoadBalancerModel.reconcileHTTPListener(ctx, params); err != nil {
@@ -526,12 +670,12 @@ func (m *gatewayModelImpl) programGateway(ctx context.Context, data *resolvedGat
 		}
 	}
 
-	if err = m.ociLoadBalancerModel.removeMissingListeners(ctx, removeMissingListenersParams{
-		loadBalancerID:   loadBalancerID,
-		knownListeners:   response.LoadBalancer.Listeners,
-		gatewayListeners: gatewayListeners,
-	}); err != nil {
-		return fmt.Errorf("failed to remove missing listeners: %w", err)
+	if err = m.removeMissingGatewayListeners(ctx, loadBalancerID, response.LoadBalancer, gatewayListeners); err != nil {
+		return err
+	}
+
+	if err = m.cleanupFrontendMTLSCABundles(ctx, data, gatewayManagedListeners, response.LoadBalancer); err != nil {
+		return err
 	}
 
 	if err = m.ociLoadBalancerModel.removeUnusedCertificates(ctx, removeUnusedCertificatesParams{
@@ -550,6 +694,164 @@ func (m *gatewayModelImpl) programGateway(ctx context.Context, data *resolvedGat
 	return nil
 }
 
+func (m *gatewayModelImpl) reconcileGatewayListenerCertificates(
+	ctx context.Context,
+	data *resolvedGatewayDetails,
+	gatewayListeners []gatewayv1.Listener,
+	loadBalancer loadbalancer.LoadBalancer,
+) (reconcileListenersCertificatesResult, error) {
+	result, err := m.ociLoadBalancerModel.reconcileListenersCertificates(ctx, reconcileListenersCertificatesParams{
+		loadBalancerID:    data.config.Spec.LoadBalancerID,
+		gateway:           &data.gateway,
+		gatewayListeners:  gatewayListeners,
+		knownCertificates: loadBalancer.Certificates,
+	})
+	if err != nil {
+		if isFrontendMTLSStatusError(err) {
+			if removeErr := m.failClosedFrontendMTLSListeners(
+				ctx,
+				data,
+				gatewayListeners,
+				loadBalancer,
+			); removeErr != nil {
+				return reconcileListenersCertificatesResult{}, removeErr
+			}
+		}
+		return reconcileListenersCertificatesResult{}, fmt.Errorf("failed to reconcile listeners certificates: %w", err)
+	}
+	return result, nil
+}
+
+func (m *gatewayModelImpl) removeMissingGatewayListeners(
+	ctx context.Context,
+	loadBalancerID string,
+	loadBalancer loadbalancer.LoadBalancer,
+	gatewayListeners []gatewayv1.Listener,
+) error {
+	if err := m.ociLoadBalancerModel.removeMissingListeners(ctx, removeMissingListenersParams{
+		loadBalancerID:       loadBalancerID,
+		knownListeners:       loadBalancer.Listeners,
+		knownRoutingPolicies: loadBalancer.RoutingPolicies,
+		gatewayListeners:     gatewayListeners,
+	}); err != nil {
+		return fmt.Errorf("failed to remove missing listeners: %w", err)
+	}
+	return nil
+}
+
+func (m *gatewayModelImpl) failClosedFrontendMTLSListeners(
+	ctx context.Context,
+	data *resolvedGatewayDetails,
+	gatewayListeners []gatewayv1.Listener,
+	loadBalancer loadbalancer.LoadBalancer,
+) error {
+	if err := m.ociLoadBalancerModel.removeMissingListeners(ctx, removeMissingListenersParams{
+		loadBalancerID:       data.config.Spec.LoadBalancerID,
+		knownListeners:       loadBalancer.Listeners,
+		knownRoutingPolicies: loadBalancer.RoutingPolicies,
+		gatewayListeners:     gatewayListenersWithoutFrontendMTLS(data.gateway, gatewayListeners),
+	}); err != nil {
+		return fmt.Errorf("failed to fail closed frontend mTLS listeners: %w", err)
+	}
+	return nil
+}
+
+func gatewayListenersWithoutFrontendMTLS(
+	gateway gatewayv1.Gateway,
+	gatewayListeners []gatewayv1.Listener,
+) []gatewayv1.Listener {
+	keptListeners := []gatewayv1.Listener(nil)
+	for _, listener := range gatewayListeners {
+		if listenerUsesFrontendMTLS(gateway, listener) {
+			continue
+		}
+		keptListeners = append(keptListeners, listener)
+	}
+	return keptListeners
+}
+
+func (m *gatewayModelImpl) cleanupFrontendMTLSCABundles(
+	ctx context.Context,
+	data *resolvedGatewayDetails,
+	gatewayManagedListeners []gatewayv1.Listener,
+	loadBalancer loadbalancer.LoadBalancer,
+) error {
+	desiredBundleNames := desiredFrontendMTLSCABundleNames(data.gateway, gatewayManagedListeners)
+	if len(desiredBundleNames) == 0 &&
+		data.gateway.Annotations[GatewayFrontendMTLSCABundleCompartmentsAnnotation] == "" {
+		return nil
+	}
+	if err := m.ociLoadBalancerModel.cleanupFrontendMTLSCABundles(ctx, cleanupFrontendMTLSCABundlesParams{
+		gateway:            &data.gateway,
+		compartmentID:      lo.FromPtr(loadBalancer.CompartmentId),
+		desiredBundleNames: desiredBundleNames,
+	}); err != nil {
+		return fmt.Errorf("failed to clean up frontend mTLS CA bundles: %w", err)
+	}
+	return nil
+}
+
+func desiredFrontendMTLSCABundleNames(
+	gateway gatewayv1.Gateway,
+	gatewayManagedListeners []gatewayv1.Listener,
+) map[string]struct{} {
+	desiredBundleNames := make(map[string]struct{})
+	for _, listener := range gatewayManagedListeners {
+		if !gatewayFrontendMTLSConfigured(gateway) || listener.TLS == nil {
+			continue
+		}
+		if listenerOCICertificateOCID(listener) == "" {
+			continue
+		}
+		validation := effectiveFrontendTLSValidation(gateway, listener.Port)
+		if validation == nil || len(validation.CACertificateRefs) == 0 {
+			continue
+		}
+		for _, ref := range validation.CACertificateRefs {
+			desiredBundleNames[frontendMTLSCABundleName(gateway, listener.Port, ref)] = struct{}{}
+		}
+	}
+	return desiredBundleNames
+}
+
+func listenerUsesFrontendMTLS(gateway gatewayv1.Gateway, listener gatewayv1.Listener) bool {
+	if listener.TLS == nil {
+		return false
+	}
+	if validation := effectiveFrontendTLSValidation(gateway, listener.Port); validation != nil {
+		return true
+	}
+	return len(frontendMTLSOCICABundleIDs(gateway, listener.Port)) > 0
+}
+
+func gatewayFrontendMTLSConfigured(gateway gatewayv1.Gateway) bool {
+	if gateway.Spec.TLS != nil && gateway.Spec.TLS.Frontend != nil {
+		frontend := gateway.Spec.TLS.Frontend
+		if frontend.Default.Validation != nil {
+			return true
+		}
+		for _, portConfig := range frontend.PerPort {
+			if portConfig.TLS.Validation != nil {
+				return true
+			}
+		}
+	}
+	if gateway.Annotations == nil {
+		return false
+	}
+	for key, value := range gateway.Annotations {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		if key == FrontendMTLSTrustedCABundleOCIDsAnnotation ||
+			key == FrontendMTLSVerifyDepthAnnotation ||
+			strings.HasPrefix(key, "oci.oraclecloud.com/frontend-mtls-") {
+			return true
+		}
+	}
+	return false
+}
+
 func gatewayStatusAddressesFromLoadBalancer(lb *loadbalancer.LoadBalancer) []gatewayv1.GatewayStatusAddress {
 	if lb == nil || len(lb.IpAddresses) == 0 {
 		return nil
@@ -566,56 +868,28 @@ func gatewayStatusAddressesFromLoadBalancer(lb *loadbalancer.LoadBalancer) []gat
 }
 
 func (m *gatewayModelImpl) isProgrammed(_ context.Context, data *resolvedGatewayDetails) bool {
-	annotations := map[string]string{
-		GatewayProgrammingRevisionAnnotation: GatewayProgrammingRevisionValue,
-		GatewayProgrammedCertificatesAnnotation: programmedGatewayCertificatesAnnotation(
-			programmedCertificateNamesFromSecrets(data.gatewaySecrets),
-		),
-	}
-
-	// Include secrets annotations in the check
-	if len(data.gatewaySecrets) > 0 {
-		for _, secret := range data.gatewaySecrets {
-			secretUID := string(secret.UID)
-			annotationKey := GatewayUsedSecretsAnnotationPrefix + "/" + secretUID
-			annotations[annotationKey] = secret.ResourceVersion
-		}
-	}
-
 	return m.resourcesModel.isConditionSet(isConditionSetParams{
 		resource:      &data.gateway,
 		conditions:    data.gateway.Status.Conditions,
 		conditionType: string(gatewayv1.GatewayConditionProgrammed),
-		annotations:   annotations,
+		annotations:   programmedGatewayAnnotations(data),
 	})
 }
 
 func (m *gatewayModelImpl) setProgrammed(ctx context.Context, data *resolvedGatewayDetails) error {
-	annotations := map[string]string{
-		GatewayProgrammingRevisionAnnotation: GatewayProgrammingRevisionValue,
-		GatewayProgrammedCertificatesAnnotation: programmedGatewayCertificatesAnnotation(
-			programmedCertificateNamesFromSecrets(data.gatewaySecrets),
-		),
-	}
-
-	if len(data.gatewaySecrets) > 0 {
-		for _, secret := range data.gatewaySecrets {
-			secretUID := string(secret.UID)
-			annotationKey := GatewayUsedSecretsAnnotationPrefix + "/" + secretUID
-			annotations[annotationKey] = secret.ResourceVersion
-		}
-	}
+	annotations := programmedGatewayAnnotations(data)
 
 	data.gateway.Status.Addresses = gatewayStatusAddressesFromLoadBalancer(data.loadBalancer)
 	data.gateway.Status.AttachedListenerSets = attachedListenerSetCount(data.listenerSets, data.effectiveListeners)
 	if err := m.resourcesModel.setCondition(ctx, setConditionParams{
-		resource:      &data.gateway,
-		conditions:    &data.gateway.Status.Conditions,
-		conditionType: string(gatewayv1.GatewayConditionProgrammed),
-		status:        metav1.ConditionTrue,
-		reason:        string(gatewayv1.GatewayReasonProgrammed),
-		message:       fmt.Sprintf("Gateway %s programmed by %s", data.gateway.Name, ControllerClassName),
-		annotations:   annotations,
+		resource:          &data.gateway,
+		conditions:        &data.gateway.Status.Conditions,
+		conditionType:     string(gatewayv1.GatewayConditionProgrammed),
+		status:            metav1.ConditionTrue,
+		reason:            string(gatewayv1.GatewayReasonProgrammed),
+		message:           fmt.Sprintf("Gateway %s programmed by %s", data.gateway.Name, ControllerClassName),
+		annotations:       annotations,
+		removeAnnotations: staleProgrammedGatewayAnnotations(annotations),
 	}); err != nil {
 		return fmt.Errorf("failed to set programmed condition for Gateway %s: %w", data.gateway.Name, err)
 	}
@@ -628,6 +902,81 @@ func (m *gatewayModelImpl) setProgrammed(ctx context.Context, data *resolvedGate
 		return err
 	}
 	return nil
+}
+
+func programmedGatewayAnnotations(data *resolvedGatewayDetails) map[string]string {
+	annotations := map[string]string{
+		GatewayProgrammingRevisionAnnotation: GatewayProgrammingRevisionValue,
+		GatewayProgrammedCertificatesAnnotation: programmedGatewayCertificatesAnnotation(
+			programmedCertificateNamesFromSecrets(data.gatewaySecrets),
+		),
+	}
+
+	if len(data.gatewaySecrets) > 0 {
+		for _, secret := range data.gatewaySecrets {
+			secretUID := string(secret.UID)
+			annotationKey := GatewayUsedSecretsAnnotationPrefix + "/" + secretUID
+			annotations[annotationKey] = secret.ResourceVersion
+		}
+	}
+
+	if len(frontendMTLSConfigMapRefs(data.gateway)) > 0 {
+		annotations[GatewayFrontendMTLSConfigMapsAnnotation] = configMapRevisionsAnnotation(
+			data.gatewayFrontendMTLSConfigMaps,
+		)
+	}
+	if len(data.gatewayFrontendMTLSReferenceGrants) > 0 ||
+		gatewayHasCrossNamespaceFrontendMTLSConfigMapRefs(data.gateway) {
+		annotations[GatewayFrontendMTLSReferenceGrantsAnnotation] = referenceGrantRevisionsAnnotation(
+			data.gatewayFrontendMTLSReferenceGrants,
+		)
+	}
+	return annotations
+}
+
+func staleProgrammedGatewayAnnotations(annotations map[string]string) []string {
+	keys := []string{
+		GatewayFrontendMTLSConfigMapsAnnotation,
+		GatewayFrontendMTLSReferenceGrantsAnnotation,
+	}
+	stale := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if _, found := annotations[key]; !found {
+			stale = append(stale, key)
+		}
+	}
+	return stale
+}
+
+func gatewayHasCrossNamespaceFrontendMTLSConfigMapRefs(gateway gatewayv1.Gateway) bool {
+	for _, ref := range frontendMTLSConfigMapRefs(gateway) {
+		if ref.Namespace != gateway.Namespace {
+			return true
+		}
+	}
+	return false
+}
+
+func configMapRevisionsAnnotation(objects map[string]corev1.ConfigMap) string {
+	keys := lo.Keys(objects)
+	sort.Strings(keys)
+	revisions := make([]string, 0, len(keys))
+	for _, key := range keys {
+		object := objects[key]
+		revisions = append(revisions, fmt.Sprintf("%s=%s/%s", key, object.UID, object.ResourceVersion))
+	}
+	return strings.Join(revisions, ",")
+}
+
+func referenceGrantRevisionsAnnotation(objects map[string]gatewayv1beta1.ReferenceGrant) string {
+	keys := lo.Keys(objects)
+	sort.Strings(keys)
+	revisions := make([]string, 0, len(keys))
+	for _, key := range keys {
+		object := objects[key]
+		revisions = append(revisions, fmt.Sprintf("%s=%s/%s", key, object.UID, object.ResourceVersion))
+	}
+	return strings.Join(revisions, ",")
 }
 
 func setListenerSetsProgrammed(

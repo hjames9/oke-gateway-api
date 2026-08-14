@@ -19,6 +19,12 @@ const (
 	// GatewayProgrammedCertificatesAnnotation stores OCI certificate names programmed by the controller.
 	GatewayProgrammedCertificatesAnnotation = "oke-gateway-api.gemyago.github.io/gateway-programmed-certificates"
 
+	// GatewayFrontendMTLSConfigMapsAnnotation stores frontend mTLS CA ConfigMap revisions.
+	GatewayFrontendMTLSConfigMapsAnnotation = "frontend-mtls-configmaps.oke-gateway-api.gemyago.github.io"
+
+	// GatewayFrontendMTLSReferenceGrantsAnnotation stores frontend mTLS ReferenceGrant revisions.
+	GatewayFrontendMTLSReferenceGrantsAnnotation = "frontend-mtls-referencegrants.oke-gateway-api.gemyago.github.io"
+
 	// ListenerTLSOptionOCICertificateOCID configures an existing OCI Certificates Service certificate for a listener.
 	ListenerTLSOptionOCICertificateOCID = "oci.oraclecloud.com/certificate-ocid"
 
@@ -27,6 +33,15 @@ const (
 
 	// ListenerTLSOptionCipherSuiteName configures OCI listener SSL cipher suite name.
 	ListenerTLSOptionCipherSuiteName = "oci.oraclecloud.com/cipher-suite-name"
+
+	// FrontendMTLSTrustedCABundleOCIDsAnnotation adds existing OCI CA bundle OCIDs to frontend mTLS.
+	FrontendMTLSTrustedCABundleOCIDsAnnotation = "oci.oraclecloud.com/frontend-mtls-trusted-ca-bundle-ocids"
+
+	// FrontendMTLSVerifyDepthAnnotation configures OCI frontend mTLS peer certificate verification depth.
+	FrontendMTLSVerifyDepthAnnotation = "oci.oraclecloud.com/frontend-mtls-verify-depth"
+
+	// GatewayFrontendMTLSCABundleCompartmentsAnnotation stores OCI compartments with controller-managed CA bundles.
+	GatewayFrontendMTLSCABundleCompartmentsAnnotation = "oke-gateway-api.gemyago.github.io/frontend-mtls-compartments"
 
 	// BackendTLSPolicyProgrammedFinalizer is used to clean up controller-managed OCI CA bundles.
 	BackendTLSPolicyProgrammedFinalizer = "oke-gateway-api.gemyago.github.io/backend-tls-policy-programmed"
