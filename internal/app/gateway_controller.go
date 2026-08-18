@@ -10,6 +10,7 @@ import (
 	"go.uber.org/dig"
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -105,6 +106,16 @@ func (r *GatewayController) Reconcile(ctx context.Context, req reconcile.Request
 		slog.Int64("generation", data.gateway.Generation),
 	)
 
+	if data.gateway.DeletionTimestamp != nil {
+		if !controllerutil.ContainsFinalizer(&data.gateway, LoadBalancerGatewayProgrammedFinalizer) {
+			return reconcile.Result{}, nil
+		}
+		if err = r.gatewayModel.deprovisionGateway(ctx, &data); err != nil {
+			return r.processResourceError(ctx, err, &data.gateway)
+		}
+		return reconcile.Result{}, nil
+	}
+
 	if !isGatewayAccepted(&data.gateway) {
 		if err = r.resourcesModel.setCondition(ctx, setConditionParams{
 			resource:      &data.gateway,
@@ -136,6 +147,27 @@ func (r *GatewayController) Reconcile(ctx context.Context, req reconcile.Request
 			slog.String("loadBalancerID", data.config.Spec.LoadBalancerID),
 		)
 
+		if err = r.resourcesModel.setCondition(ctx, setConditionParams{
+			resource:      &data.gateway,
+			conditions:    &data.gateway.Status.Conditions,
+			conditionType: string(gatewayv1.GatewayConditionProgrammed),
+			status:        v1.ConditionUnknown,
+			reason:        string(gatewayv1.GatewayReasonPending),
+			message: fmt.Sprintf(
+				"Gateway %s programming by %s is in progress",
+				data.gateway.Name,
+				ControllerClassName,
+			),
+			annotations: loadBalancerGatewayProtectionAnnotations(&data),
+			finalizer:   LoadBalancerGatewayProgrammedFinalizer,
+		}); err != nil {
+			return reconcile.Result{}, fmt.Errorf(
+				"failed to persist programming protection for Gateway %s: %w",
+				req.NamespacedName,
+				err,
+			)
+		}
+
 		if err = r.gatewayModel.programGateway(ctx, &data); err != nil {
 			return r.processResourceError(ctx, err, &data.gateway)
 		}
@@ -160,4 +192,17 @@ func (r *GatewayController) Reconcile(ctx context.Context, req reconcile.Request
 	}
 
 	return driftRequeue(r.driftInterval), nil
+}
+
+func loadBalancerGatewayProtectionAnnotations(data *resolvedGatewayDetails) map[string]string {
+	loadBalancerID := data.config.Spec.LoadBalancerID
+	if loadBalancerID == "" {
+		loadBalancerID = data.gateway.Annotations[LoadBalancerGatewayIDAnnotation]
+	}
+	if loadBalancerID == "" {
+		return nil
+	}
+	return map[string]string{
+		LoadBalancerGatewayIDAnnotation: loadBalancerID,
+	}
 }
