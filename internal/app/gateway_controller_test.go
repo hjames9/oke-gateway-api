@@ -504,7 +504,6 @@ func TestGatewayController(t *testing.T) {
 					gateway: *gateway,
 				}).
 				Return(false).Once()
-
 			wantErr := errors.New(fake.Lorem().Sentence(10))
 
 			expectGatewayProgrammingProtection(mockResourcesModel, gateway, nil)
@@ -551,7 +550,6 @@ func TestGatewayController(t *testing.T) {
 					gateway: *gateway,
 				}).
 				Return(false).Once()
-
 			wantErr := &resourceStatusError{
 				conditionType: string(gatewayv1.GatewayConditionProgrammed),
 				reason:        fake.Lorem().Word(),
@@ -613,7 +611,6 @@ func TestGatewayController(t *testing.T) {
 					gateway: *gateway,
 				}).
 				Return(false).Once()
-
 			wantErr := &resourceStatusError{
 				conditionType: string(gatewayv1.GatewayConditionProgrammed),
 				reason:        fake.Lorem().Word(),
@@ -673,7 +670,6 @@ func TestGatewayController(t *testing.T) {
 					gateway: *gateway,
 				}).
 				Return(false).Once()
-
 			wantErr := errors.New(fake.Lorem().Sentence(10))
 
 			expectGatewayProgrammingProtection(mockResourcesModel, gateway, nil)
@@ -692,6 +688,43 @@ func TestGatewayController(t *testing.T) {
 
 			require.Error(t, err)
 			require.ErrorIs(t, err, wantErr)
+			assert.Equal(t, reconcile.Result{}, result)
+		})
+
+		t.Run("handle pending programmed condition error", func(t *testing.T) {
+			fake := faker.New()
+			gateway := newRandomGateway()
+			markGatewayAccepted(gateway)
+
+			req := reconcile.Request{
+				NamespacedName: client.ObjectKey{
+					Namespace: gateway.Namespace,
+					Name:      gateway.Name,
+				},
+			}
+
+			deps := newMockDeps(t)
+			controller := NewGatewayController(deps)
+			mockResourcesModel, _ := deps.ResourcesModel.(*MockresourcesModel)
+			mockGatewayModel, _ := deps.GatewayModel.(*MockgatewayModel)
+
+			mockGatewayModel.EXPECT().
+				resolveReconcileRequest(t.Context(), req, mock.MatchedBy(func(receiver *resolvedGatewayDetails) bool {
+					receiver.gateway = *gateway
+					return true
+				})).
+				Return(true, nil).Once()
+			mockGatewayModel.EXPECT().
+				isProgrammed(t.Context(), &resolvedGatewayDetails{gateway: *gateway}).
+				Return(false).Once()
+
+			wantErr := errors.New(fake.Lorem().Sentence(10))
+			mockResourcesModel.EXPECT().setCondition(t.Context(), mock.Anything).Return(wantErr).Once()
+
+			result, err := controller.Reconcile(t.Context(), req)
+
+			require.ErrorIs(t, err, wantErr)
+			require.ErrorContains(t, err, "failed to persist programming protection")
 			assert.Equal(t, reconcile.Result{}, result)
 		})
 
