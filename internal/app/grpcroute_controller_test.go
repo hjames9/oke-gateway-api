@@ -386,6 +386,45 @@ func TestGRPCRouteController(t *testing.T) {
 		require.ErrorIs(t, err, wantErr)
 	})
 
+	t.Run("sets rejected status for programming status errors", func(t *testing.T) {
+		route := makeRoute()
+		resolved := makeResolved(route)
+		service := corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: route.Namespace, Name: "grpc-svc"}}
+		statusErr := grpcRouteStatusError{
+			conditionType: gatewayv1.RouteConditionResolvedRefs,
+			reason:        gatewayv1.RouteReasonInvalidKind,
+			message:       "BackendTLSPolicy is required for OCI GRPCRoute backends",
+		}
+		routeModel := fakeGRPCRouteModel{
+			resolveRequestFunc: func(
+				_ context.Context,
+				_ reconcile.Request,
+			) (map[routeParentResultKey]resolvedGRPCRouteDetails, error) {
+				return resolvedMap(route, resolved), nil
+			},
+			isProgrammingRequiredFn: func(resolvedGRPCRouteDetails) bool { return true },
+			acceptRouteFunc: func(_ context.Context, details resolvedGRPCRouteDetails) (*gatewayv1.GRPCRoute, error) {
+				return &details.grpcRoute, nil
+			},
+			resolveBackendRefsFunc: func(context.Context, resolveGRPCBackendRefsParams) (map[string]corev1.Service, error) {
+				return map[string]corev1.Service{service.Namespace + "/" + service.Name: service}, nil
+			},
+			programRouteFunc: func(context.Context, programGRPCRouteParams) (programGRPCRouteResult, error) {
+				return programGRPCRouteResult{}, statusErr
+			},
+			setRejectedFunc: func(_ context.Context, details resolvedGRPCRouteDetails, gotErr grpcRouteStatusError) error {
+				assert.Equal(t, route.Name, details.grpcRoute.Name)
+				assert.Equal(t, statusErr, gotErr)
+				return nil
+			},
+		}
+
+		got, err := newController(routeModel, NewMockhttpBackendModel(t)).Reconcile(t.Context(), reconcile.Request{})
+
+		require.NoError(t, err)
+		assertDriftRequeue(t, got, 2*time.Minute)
+	})
+
 	t.Run("returns accept route errors", func(t *testing.T) {
 		route := makeRoute()
 		resolved := makeResolved(route)
@@ -511,6 +550,45 @@ func TestGRPCRouteController(t *testing.T) {
 			setRejectedFunc: func(_ context.Context, details resolvedGRPCRouteDetails, gotErr grpcRouteStatusError) error {
 				assert.Equal(t, route.Name, details.grpcRoute.Name)
 				assert.Equal(t, statusErr, gotErr)
+				return nil
+			},
+		}
+
+		got, err := newController(routeModel, NewMockhttpBackendModel(t)).Reconcile(t.Context(), reconcile.Request{})
+
+		require.NoError(t, err)
+		assertDriftRequeue(t, got, 2*time.Minute)
+	})
+
+	t.Run("rejects previously programmed route when backend service disappears", func(t *testing.T) {
+		fake := faker.New()
+		route := makeRoute()
+		route.Annotations = map[string]string{
+			GRPCRouteProgrammedPolicyRulesAnnotation: "grpc/rule-" + fake.Lorem().Word(),
+		}
+		resolved := makeResolved(route)
+		statusErr := newGRPCRouteBackendNotFoundStatusError(
+			"backendRef service " + route.Namespace + "/missing-" + fake.Lorem().Word() + " not found",
+		)
+		routeModel := fakeGRPCRouteModel{
+			resolveRequestFunc: func(
+				_ context.Context,
+				_ reconcile.Request,
+			) (map[routeParentResultKey]resolvedGRPCRouteDetails, error) {
+				return resolvedMap(route, resolved), nil
+			},
+			isProgrammingRequiredFn: func(resolvedGRPCRouteDetails) bool { return true },
+			acceptRouteFunc: func(_ context.Context, details resolvedGRPCRouteDetails) (*gatewayv1.GRPCRoute, error) {
+				return &details.grpcRoute, nil
+			},
+			resolveBackendRefsFunc: func(context.Context, resolveGRPCBackendRefsParams) (map[string]corev1.Service, error) {
+				return nil, statusErr
+			},
+			setRejectedFunc: func(_ context.Context, details resolvedGRPCRouteDetails, gotErr grpcRouteStatusError) error {
+				assert.Equal(t, route.Name, details.grpcRoute.Name)
+				assert.Equal(t, gatewayv1.RouteConditionResolvedRefs, gotErr.conditionType)
+				assert.Equal(t, gatewayv1.RouteReasonBackendNotFound, gotErr.reason)
+				assert.Equal(t, statusErr.message, gotErr.message)
 				return nil
 			},
 		}

@@ -71,6 +71,20 @@ type setProgrammedParams struct {
 	programmedBackendSets []string
 }
 
+type setL7RouteRejectedParams struct {
+	resource                        client.Object
+	parentStatuses                  *[]gatewayv1.RouteParentStatus
+	gatewayClass                    gatewayv1.GatewayClass
+	matchedRef                      gatewayv1.ParentReference
+	loadBalancerID                  string
+	matchedListeners                []gatewayv1.Listener
+	programmedPolicyRulesAnnotation string
+	routeKind                       string
+	conditionType                   gatewayv1.RouteConditionType
+	reason                          gatewayv1.RouteConditionReason
+	message                         string
+}
+
 type programmedHTTPRoutePolicyRule struct {
 	listenerName string
 	ruleName     string
@@ -136,7 +150,7 @@ type programL7RoutePolicyParams struct {
 	previousPolicyRules []programmedHTTPRoutePolicyRule
 	previousBackendSets map[string]struct{}
 	ruleCount           int
-	makeRoutingRule     func(ruleIndex int) (loadbalancer.RoutingRule, error)
+	makeRoutingRule     func(ruleIndex int, listenerPort gatewayv1.PortNumber) (loadbalancer.RoutingRule, error)
 	backendTLSPolicy    backendTLSPolicyModel
 	backendTLSDisabled  bool
 }
@@ -154,7 +168,7 @@ type programL7RouteParams struct {
 	ruleCount             int
 	policyRulesAnnotation string
 	backendSetsAnnotation string
-	makeRoutingRule       func(ruleIndex int) (loadbalancer.RoutingRule, error)
+	makeRoutingRule       func(ruleIndex int, listenerPort gatewayv1.PortNumber) (loadbalancer.RoutingRule, error)
 }
 
 type setL7RouteProgrammedParams struct {
@@ -246,6 +260,12 @@ type httpRouteModel interface {
 		params deprovisionRouteParams,
 	) error
 
+	setRejected(
+		ctx context.Context,
+		routeDetails resolvedRouteDetails,
+		statusErr httpRouteStatusError,
+	) error
+
 	// setProgrammed marks the route as successfully programmed by updating its status.
 	setProgrammed(
 		ctx context.Context,
@@ -257,6 +277,24 @@ type httpRouteModel interface {
 		ctx context.Context,
 		params setProgrammedParams,
 	) error
+}
+
+type httpRouteStatusError struct {
+	conditionType gatewayv1.RouteConditionType
+	reason        gatewayv1.RouteConditionReason
+	message       string
+}
+
+func (e httpRouteStatusError) Error() string {
+	return e.message
+}
+
+func newHTTPRouteBackendNotFoundStatusError(message string) httpRouteStatusError {
+	return httpRouteStatusError{
+		conditionType: gatewayv1.RouteConditionResolvedRefs,
+		reason:        gatewayv1.RouteReasonBackendNotFound,
+		message:       message,
+	}
 }
 
 // parentRefSameTarget checks if two parent references target the same resource.
@@ -1112,6 +1150,27 @@ func (m *httpRouteModelImpl) rejectRoute(
 	})
 }
 
+func (m *httpRouteModelImpl) setRejected(
+	ctx context.Context,
+	routeDetails resolvedRouteDetails,
+	statusErr httpRouteStatusError,
+) error {
+	httpRoute := routeDetails.httpRoute.DeepCopy()
+	return setL7RouteRejected(ctx, m.resourcesModel, m.ociLoadBalancerModel, setL7RouteRejectedParams{
+		resource:                        httpRoute,
+		parentStatuses:                  &httpRoute.Status.Parents,
+		gatewayClass:                    routeDetails.gatewayDetails.gatewayClass,
+		matchedRef:                      routeDetails.matchedRef,
+		loadBalancerID:                  routeDetails.gatewayDetails.config.Spec.LoadBalancerID,
+		matchedListeners:                routeDetails.matchedListeners,
+		programmedPolicyRulesAnnotation: HTTPRouteProgrammedPolicyRulesAnnotation,
+		routeKind:                       "HTTPRoute",
+		conditionType:                   statusErr.conditionType,
+		reason:                          statusErr.reason,
+		message:                         statusErr.message,
+	})
+}
+
 func (m *httpRouteModelImpl) resolveBackendRefs(
 	ctx context.Context,
 	params resolveBackendRefsParams,
@@ -1123,6 +1182,11 @@ func (m *httpRouteModelImpl) resolveBackendRefs(
 
 			var service v1.Service
 			if err := m.client.Get(ctx, fullName, &service); err != nil {
+				if apierrors.IsNotFound(err) {
+					return nil, newHTTPRouteBackendNotFoundStatusError(
+						fmt.Sprintf("backendRef service %s not found", fullName.String()),
+					)
+				}
 				return nil, fmt.Errorf("failed to get service %s: %w", fullName.String(), err)
 			}
 
@@ -1152,20 +1216,13 @@ func programL7RoutePolicy(
 		return nil, nil, reconcileErr
 	}
 
-	policyRules := make([]loadbalancer.RoutingRule, 0, params.ruleCount)
 	policyRuleNames := make([]string, 0, params.ruleCount)
-	for ruleIndex := range params.ruleCount {
-		rule, err := params.makeRoutingRule(ruleIndex)
-		if err != nil {
-			return nil, nil, fmt.Errorf(
-				"failed to make routing rule %d for route %s: %w",
-				ruleIndex,
-				params.routeName,
-				err,
-			)
+	recordPolicyRuleName := func(rule loadbalancer.RoutingRule) {
+		ruleName := lo.FromPtr(rule.Name)
+		if ruleName == "" || lo.Contains(policyRuleNames, ruleName) {
+			return
 		}
-		policyRules = append(policyRules, rule)
-		policyRuleNames = append(policyRuleNames, *rule.Name)
+		policyRuleNames = append(policyRuleNames, ruleName)
 	}
 
 	prevRulesByListener := previousPolicyRulesByListener(params.previousPolicyRules, params.matchedListeners)
@@ -1177,6 +1234,21 @@ func programL7RoutePolicy(
 	)
 
 	for _, listener := range params.matchedListeners {
+		policyRules := make([]loadbalancer.RoutingRule, 0, params.ruleCount)
+		for ruleIndex := range params.ruleCount {
+			rule, err := params.makeRoutingRule(ruleIndex, listener.Port)
+			if err != nil {
+				return nil, nil, fmt.Errorf(
+					"failed to make routing rule %d for route %s: %w",
+					ruleIndex,
+					params.routeName,
+					err,
+				)
+			}
+			policyRules = append(policyRules, rule)
+			recordPolicyRuleName(rule)
+		}
+
 		listenerName := string(listener.Name)
 		err := ociLoadBalancerModel.commitRoutingPolicy(ctx, commitRoutingPolicyParams{
 			loadBalancerID:  params.loadBalancerID,
@@ -1396,10 +1468,11 @@ func (m *httpRouteModelImpl) programRoute(
 		ruleCount:             len(params.httpRoute.Spec.Rules),
 		policyRulesAnnotation: HTTPRouteProgrammedPolicyRulesAnnotation,
 		backendSetsAnnotation: HTTPRouteProgrammedBackendSetsAnnotation,
-		makeRoutingRule: func(ruleIndex int) (loadbalancer.RoutingRule, error) {
+		makeRoutingRule: func(ruleIndex int, listenerPort gatewayv1.PortNumber) (loadbalancer.RoutingRule, error) {
 			return m.ociLoadBalancerModel.makeRoutingRule(ctx, makeRoutingRuleParams{
 				httpRoute:          params.httpRoute,
 				httpRouteRuleIndex: ruleIndex,
+				listenerPort:       listenerPort,
 			})
 		},
 	})
@@ -1454,23 +1527,15 @@ func (m *httpRouteModelImpl) deprovisionRoute(
 		}
 	}
 
-	// TODO: Dedup and filter-out non service refs
-	for _, rule := range params.httpRoute.Spec.Rules {
-		for _, backendRef := range rule.BackendRefs {
-			err := m.ociLoadBalancerModel.deprovisionBackendSet(ctx, deprovisionBackendSetParams{
-				loadBalancerID: params.config.Spec.LoadBalancerID,
-				routeNamespace: params.httpRoute.Namespace,
-				backendRef:     backendRef.BackendRef,
-			})
-			if err != nil {
-				return fmt.Errorf(
-					"failed to deprovision backend set for rule %s/%s: %w",
-					params.httpRoute.Namespace,
-					params.httpRoute.Name,
-					err,
-				)
-			}
-		}
+	if err := deprovisionL7BackendSets(ctx, m.ociLoadBalancerModel, deprovisionL7BackendSetsParams{
+		loadBalancerID:      params.config.Spec.LoadBalancerID,
+		routeKind:           l7HTTPRouteKind,
+		routeNamespace:      params.httpRoute.Namespace,
+		routeName:           params.httpRoute.Name,
+		backendRefs:         httpRouteBackendRefs(params.httpRoute),
+		previousBackendSets: annotatedBackendSetNames(&params.httpRoute, HTTPRouteProgrammedBackendSetsAnnotation),
+	}); err != nil {
+		return err
 	}
 
 	routeToUpdate := params.httpRoute.DeepCopy()
@@ -1491,6 +1556,7 @@ type deprovisionDetachedL7RouteParams struct {
 	route                 client.Object
 	routeKind             string
 	policyRulesAnnotation string
+	backendSetsAnnotation string
 	loadBalancerID        string
 	backendRefs           []gatewayv1.BackendRef
 	removeFinalizer       func(context.Context) error
@@ -1512,25 +1578,77 @@ func deprovisionDetachedL7Route(
 		}
 	}
 
+	if err := deprovisionL7BackendSets(ctx, ociLoadBalancerModel, deprovisionL7BackendSetsParams{
+		loadBalancerID: params.loadBalancerID,
+		routeKind:      l7RouteKind(params.routeKind),
+		routeNamespace: params.route.GetNamespace(),
+		routeName:      params.route.GetName(),
+		backendRefs:    params.backendRefs,
+		previousBackendSets: annotatedBackendSetNames(
+			params.route,
+			params.backendSetsAnnotation,
+		),
+	}); err != nil {
+		return fmt.Errorf("failed to deprovision detached %s backend sets: %w", params.routeKind, err)
+	}
+
+	return params.removeFinalizer(ctx)
+}
+
+type deprovisionL7BackendSetsParams struct {
+	loadBalancerID      string
+	routeKind           l7RouteKind
+	routeNamespace      string
+	routeName           string
+	backendRefs         []gatewayv1.BackendRef
+	previousBackendSets map[string]struct{}
+}
+
+func deprovisionL7BackendSets(
+	ctx context.Context,
+	ociLoadBalancerModel ociLoadBalancerModel,
+	params deprovisionL7BackendSetsParams,
+) error {
 	processedBackendRefs := make(map[string]struct{})
 	for _, backendRef := range params.backendRefs {
-		key := l7BackendRefKey(backendRef, params.route.GetNamespace())
+		key := l7BackendRefKey(backendRef, params.routeNamespace)
 		if _, ok := processedBackendRefs[key]; ok {
 			continue
 		}
+
+		backendSetName := ociBackendSetNameFromBackendObjectRef(
+			params.routeNamespace,
+			backendRef.BackendObjectReference,
+		)
+		if _, previouslyProgrammed := params.previousBackendSets[backendSetName]; previouslyProgrammed {
+			referenced, err := ociLoadBalancerModel.backendSetReferenced(ctx, params.loadBalancerID, backendSetName)
+			if err != nil {
+				return fmt.Errorf("failed to check backend set %s references: %w", backendSetName, err)
+			}
+			if referenced {
+				processedBackendRefs[key] = struct{}{}
+				continue
+			}
+		}
+
 		err := ociLoadBalancerModel.deprovisionBackendSet(ctx, deprovisionBackendSetParams{
 			loadBalancerID: params.loadBalancerID,
-			routeNamespace: params.route.GetNamespace(),
+			routeNamespace: params.routeNamespace,
 			backendRef:     backendRef,
 		})
 		if err != nil {
-			return fmt.Errorf("failed to deprovision detached %s backend set %s: %w",
-				params.routeKind, key, err)
+			return fmt.Errorf(
+				"failed to deprovision backend set for %s %s/%s: %w",
+				params.routeKind,
+				params.routeNamespace,
+				params.routeName,
+				err,
+			)
 		}
 		processedBackendRefs[key] = struct{}{}
 	}
 
-	return params.removeFinalizer(ctx)
+	return nil
 }
 
 func (m *httpRouteModelImpl) deprovisionDetachedRoute(
@@ -1541,6 +1659,7 @@ func (m *httpRouteModelImpl) deprovisionDetachedRoute(
 		route:                 &httpRoute,
 		routeKind:             "HTTPRoute",
 		policyRulesAnnotation: HTTPRouteProgrammedPolicyRulesAnnotation,
+		backendSetsAnnotation: HTTPRouteProgrammedBackendSetsAnnotation,
 		loadBalancerID:        httpRoute.Annotations[L7RouteProgrammedLoadBalancerIDAnnotation],
 		backendRefs:           httpRouteBackendRefs(httpRoute),
 		removeFinalizer: func(ctx context.Context) error {
@@ -1641,6 +1760,48 @@ func setL7RouteProgrammed(
 			L7RouteProgrammedLoadBalancerIDAnnotation: params.loadBalancerID,
 		},
 		finalizer: params.finalizer,
+	})
+}
+
+func setL7RouteRejected(
+	ctx context.Context,
+	resourcesModel resourcesModel,
+	ociLoadBalancerModel ociLoadBalancerModel,
+	params setL7RouteRejectedParams,
+) error {
+	if programmedPolicyRulesAnnotation, ok := params.resource.GetAnnotations()[params.programmedPolicyRulesAnnotation]; ok {
+		if err := removeL7RoutePolicyRules(
+			ctx,
+			ociLoadBalancerModel,
+			params.loadBalancerID,
+			params.matchedListeners,
+			programmedPolicyRulesAnnotation,
+		); err != nil {
+			return fmt.Errorf("failed to remove rejected %s policy rules: %w", params.routeKind, err)
+		}
+	}
+
+	_, statusIndex, found := lo.FindIndexOf(
+		*params.parentStatuses,
+		func(status gatewayv1.RouteParentStatus) bool {
+			return status.ControllerName == params.gatewayClass.Spec.ControllerName &&
+				parentRefSameTarget(status.ParentRef, params.matchedRef)
+		},
+	)
+	if !found {
+		return fmt.Errorf("parent status not found for controller %s and parentRef %s",
+			params.gatewayClass.Spec.ControllerName,
+			params.matchedRef.Name,
+		)
+	}
+
+	return resourcesModel.setCondition(ctx, setConditionParams{
+		resource:      params.resource,
+		conditions:    &(*params.parentStatuses)[statusIndex].Conditions,
+		conditionType: string(params.conditionType),
+		status:        metav1.ConditionFalse,
+		reason:        string(params.reason),
+		message:       params.message,
 	})
 }
 

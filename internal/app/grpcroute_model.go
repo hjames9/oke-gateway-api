@@ -133,6 +133,14 @@ func newGRPCRouteRefNotPermittedStatusError(message string) grpcRouteStatusError
 	}
 }
 
+func newGRPCRouteBackendNotFoundStatusError(message string) grpcRouteStatusError {
+	return grpcRouteStatusError{
+		conditionType: gatewayv1.RouteConditionResolvedRefs,
+		reason:        gatewayv1.RouteReasonBackendNotFound,
+		message:       message,
+	}
+}
+
 type grpcRouteModelImpl struct {
 	client               k8sClient
 	logger               *slog.Logger
@@ -472,6 +480,11 @@ func (m *grpcRouteModelImpl) resolveBackendRefs(
 
 			var service corev1.Service
 			if getErr := m.client.Get(ctx, fullName, &service); getErr != nil {
+				if apierrors.IsNotFound(getErr) {
+					return nil, newGRPCRouteBackendNotFoundStatusError(
+						fmt.Sprintf("backendRef service %s not found", fullName.String()),
+					)
+				}
 				return nil, fmt.Errorf("failed to get service %s: %w", fullName.String(), getErr)
 			}
 
@@ -499,10 +512,11 @@ func (m *grpcRouteModelImpl) programRoute(
 		ruleCount:             len(params.grpcRoute.Spec.Rules),
 		policyRulesAnnotation: GRPCRouteProgrammedPolicyRulesAnnotation,
 		backendSetsAnnotation: GRPCRouteProgrammedBackendSetsAnnotation,
-		makeRoutingRule: func(ruleIndex int) (loadbalancer.RoutingRule, error) {
+		makeRoutingRule: func(ruleIndex int, listenerPort gatewayv1.PortNumber) (loadbalancer.RoutingRule, error) {
 			return m.ociLoadBalancerModel.makeGRPCRoutingRule(ctx, makeGRPCRoutingRuleParams{
 				grpcRoute:          params.grpcRoute,
 				grpcRouteRuleIndex: ruleIndex,
+				listenerPort:       listenerPort,
 			})
 		},
 	})
@@ -513,12 +527,12 @@ func (m *grpcRouteModelImpl) ensureGRPCListenersProtocol(
 	params ensureGRPCListenersProtocolParams,
 ) error {
 	for _, listener := range params.matchedListeners {
-		if err := m.ociLoadBalancerModel.ensureHTTP2ListenerProtocol(ctx, ensureHTTP2ListenerProtocolParams{
+		if err := m.ociLoadBalancerModel.ensureGRPCListenerProtocol(ctx, ensureGRPCListenerProtocolParams{
 			loadBalancerID: params.config.Spec.LoadBalancerID,
 			listenerName:   string(listener.Name),
 		}); err != nil {
 			return fmt.Errorf(
-				"failed to ensure listener %s supports HTTP2: %w",
+				"failed to ensure listener %s supports GRPC: %w",
 				listener.Name,
 				err,
 			)
@@ -562,26 +576,15 @@ func (m *grpcRouteModelImpl) deprovisionRoute(
 		}
 	}
 
-	processedBackendRefs := make(map[string]struct{})
-	for _, backendRef := range grpcRouteBackendRefs(params.grpcRoute) {
-		key := l7BackendRefKey(backendRef, params.grpcRoute.Namespace)
-		if _, ok := processedBackendRefs[key]; ok {
-			continue
-		}
-		err := m.ociLoadBalancerModel.deprovisionBackendSet(ctx, deprovisionBackendSetParams{
-			loadBalancerID: params.config.Spec.LoadBalancerID,
-			routeNamespace: params.grpcRoute.Namespace,
-			backendRef:     backendRef,
-		})
-		if err != nil {
-			return fmt.Errorf(
-				"failed to deprovision backend set for rule %s/%s: %w",
-				params.grpcRoute.Namespace,
-				params.grpcRoute.Name,
-				err,
-			)
-		}
-		processedBackendRefs[key] = struct{}{}
+	if err := deprovisionL7BackendSets(ctx, m.ociLoadBalancerModel, deprovisionL7BackendSetsParams{
+		loadBalancerID:      params.config.Spec.LoadBalancerID,
+		routeKind:           l7GRPCRouteKind,
+		routeNamespace:      params.grpcRoute.Namespace,
+		routeName:           params.grpcRoute.Name,
+		backendRefs:         grpcRouteBackendRefs(params.grpcRoute),
+		previousBackendSets: annotatedBackendSetNames(&params.grpcRoute, GRPCRouteProgrammedBackendSetsAnnotation),
+	}); err != nil {
+		return err
 	}
 
 	routeToUpdate := params.grpcRoute.DeepCopy()
@@ -603,6 +606,7 @@ func (m *grpcRouteModelImpl) deprovisionDetachedRoute(
 		route:                 &grpcRoute,
 		routeKind:             "GRPCRoute",
 		policyRulesAnnotation: GRPCRouteProgrammedPolicyRulesAnnotation,
+		backendSetsAnnotation: GRPCRouteProgrammedBackendSetsAnnotation,
 		loadBalancerID:        grpcRoute.Annotations[L7RouteProgrammedLoadBalancerIDAnnotation],
 		backendRefs:           grpcRouteBackendRefs(grpcRoute),
 		removeFinalizer: func(ctx context.Context) error {
@@ -634,27 +638,18 @@ func (m *grpcRouteModelImpl) setRejected(
 	statusErr grpcRouteStatusError,
 ) error {
 	grpcRoute := routeDetails.grpcRoute.DeepCopy()
-	_, statusIndex, found := lo.FindIndexOf(
-		grpcRoute.Status.Parents,
-		func(status gatewayv1.RouteParentStatus) bool {
-			return status.ControllerName == routeDetails.gatewayDetails.gatewayClass.Spec.ControllerName &&
-				parentRefSameTarget(status.ParentRef, routeDetails.matchedRef)
-		},
-	)
-	if !found {
-		return fmt.Errorf("parent status not found for controller %s and parentRef %s",
-			routeDetails.gatewayDetails.gatewayClass.Spec.ControllerName,
-			routeDetails.matchedRef.Name,
-		)
-	}
-
-	return m.resourcesModel.setCondition(ctx, setConditionParams{
-		resource:      grpcRoute,
-		conditions:    &grpcRoute.Status.Parents[statusIndex].Conditions,
-		conditionType: string(statusErr.conditionType),
-		status:        metav1.ConditionFalse,
-		reason:        string(statusErr.reason),
-		message:       statusErr.message,
+	return setL7RouteRejected(ctx, m.resourcesModel, m.ociLoadBalancerModel, setL7RouteRejectedParams{
+		resource:                        grpcRoute,
+		parentStatuses:                  &grpcRoute.Status.Parents,
+		gatewayClass:                    routeDetails.gatewayDetails.gatewayClass,
+		matchedRef:                      routeDetails.matchedRef,
+		loadBalancerID:                  routeDetails.gatewayDetails.config.Spec.LoadBalancerID,
+		matchedListeners:                routeDetails.matchedListeners,
+		programmedPolicyRulesAnnotation: GRPCRouteProgrammedPolicyRulesAnnotation,
+		routeKind:                       "GRPCRoute",
+		conditionType:                   statusErr.conditionType,
+		reason:                          statusErr.reason,
+		message:                         statusErr.message,
 	})
 }
 
