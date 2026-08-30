@@ -3,7 +3,6 @@ package app
 import (
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/samber/lo"
@@ -12,36 +11,91 @@ import (
 
 var errUnsupportedMatch = errors.New("unsupported match type")
 
-// Allow alphanumeric characters, hyphens, underscores, and escaped dots.
-var startsWithExpression = regexp.MustCompile(`^\^([a-zA-Z0-9\-_\\\.]+?)(?:\.\*)?$`)
-
-// Allow alphanumeric characters, hyphens, underscores, and escaped dots.
-var endsWithExpression = regexp.MustCompile(`^([a-zA-Z0-9\-_\\\.]+?)\$$`)
-
-const expectedMatchesLength = 2
+const conditionArgumentSeparatorLength = len(", ")
 
 // Returns the prefix and true if it matches, empty string and false otherwise.
 func parseRegexForStartsWith(pattern string) (string, bool) {
-	matches := startsWithExpression.FindStringSubmatch(pattern)
-	if len(matches) != expectedMatchesLength {
+	value, ok := strings.CutPrefix(pattern, "^")
+	if !ok {
 		return "", false
 	}
 
-	// Unescape dots in the prefix
-	prefix := strings.ReplaceAll(matches[1], "\\.", ".")
-	return prefix, true
+	value = strings.TrimSuffix(value, ".*$")
+	value = strings.TrimSuffix(value, ".*")
+	return parseRegexLiteral(value)
 }
 
 // Returns the suffix and true if it matches, empty string and false otherwise.
 func parseRegexForEndsWith(pattern string) (string, bool) {
-	matches := endsWithExpression.FindStringSubmatch(pattern)
-	if len(matches) != expectedMatchesLength {
+	value, ok := strings.CutSuffix(pattern, "$")
+	if !ok {
 		return "", false
 	}
 
-	// Unescape dots in the suffix
-	suffix := strings.ReplaceAll(matches[1], "\\.", ".")
-	return suffix, true
+	value = strings.TrimPrefix(value, ".*")
+	return parseRegexLiteral(value)
+}
+
+func parseRegexLiteral(value string) (string, bool) {
+	if value == "" {
+		return "", false
+	}
+
+	var literal strings.Builder
+	for index := 0; index < len(value); index++ {
+		if value[index] != '\\' {
+			if !isOCIConditionLiteralByte(value[index]) {
+				return "", false
+			}
+			if isRegexMetaCharacter(value[index]) {
+				return "", false
+			}
+			literal.WriteByte(value[index])
+			continue
+		}
+
+		index++
+		if index >= len(value) {
+			return "", false
+		}
+		switch value[index] {
+		case '.', '/', '\\':
+			if !isOCIConditionLiteralByte(value[index]) {
+				return "", false
+			}
+			literal.WriteByte(value[index])
+		default:
+			return "", false
+		}
+	}
+
+	return literal.String(), true
+}
+
+func isRegexMetaCharacter(value byte) bool {
+	switch value {
+	case '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|':
+		return true
+	default:
+		return false
+	}
+}
+
+func isOCIConditionLiteralByte(value byte) bool {
+	return value >= 0x20 && value != 0x7f && value != '\''
+}
+
+func validateOCIConditionLiteral(valueKind string, value string) error {
+	for index := range len(value) {
+		if !isOCIConditionLiteralByte(value[index]) {
+			return fmt.Errorf(
+				"%w: %s contains characters unsupported by OCI routing policy conditions",
+				errUnsupportedMatch,
+				valueKind,
+			)
+		}
+	}
+	return nil
 }
 
 type ociLoadBalancerRoutingRulesMapper interface {
@@ -133,10 +187,14 @@ func mapPathMatchToCondition(pathMatch gatewayv1.HTTPPathMatch) (string, error) 
 
 	switch pathType {
 	case gatewayv1.PathMatchExact:
-		// TODO: Handle escaping single quotes in pathValue if necessary
+		if err := validateOCIConditionLiteral("path match value", pathValue); err != nil {
+			return "", err
+		}
 		return fmt.Sprintf(`http.request.url.path eq '%s'`, pathValue), nil
 	case gatewayv1.PathMatchPathPrefix:
-		// TODO: Handle escaping single quotes in pathValue if necessary
+		if err := validateOCIConditionLiteral("path match value", pathValue); err != nil {
+			return "", err
+		}
 		return fmt.Sprintf(`http.request.url.path sw '%s'`, pathValue), nil
 	case gatewayv1.PathMatchRegularExpression:
 		return "", fmt.Errorf("%w: regex path matching", errUnsupportedMatch)
@@ -153,9 +211,12 @@ func mapHeaderMatchToCondition(headerMatch gatewayv1.HTTPHeaderMatch) (string, e
 
 	switch headerType {
 	case gatewayv1.HeaderMatchExact:
-		// TODO: Handle escaping single quotes in headerMatch.Value if necessary
-		// Header names are case-insensitive in HTTP, but OCI conditions might be case-sensitive.
-		// Assuming case-sensitive match for now based on Gateway API spec.
+		if err := validateOCIConditionLiteral("header match name", string(headerMatch.Name)); err != nil {
+			return "", err
+		}
+		if err := validateOCIConditionLiteral("header match value", headerMatch.Value); err != nil {
+			return "", err
+		}
 		return fmt.Sprintf(`http.request.headers[(i '%s')] eq (i '%s')`, headerMatch.Name, headerMatch.Value), nil
 	case gatewayv1.HeaderMatchRegularExpression:
 		return mapRegexHeaderMatchToCondition(headerMatch)
@@ -169,16 +230,23 @@ func mapHeaderMatchToCondition(headerMatch gatewayv1.HTTPHeaderMatch) (string, e
 }
 
 func mapRegexHeaderMatchToCondition(headerMatch gatewayv1.HTTPHeaderMatch) (string, error) {
-	if prefix, swMatched := parseRegexForStartsWith(headerMatch.Value); swMatched {
-		return fmt.Sprintf(`http.request.headers[(i '%s')][0] sw (i '%s')`, headerMatch.Name, prefix), nil
+	return mapRegexHeaderValueToCondition(string(headerMatch.Name), headerMatch.Value)
+}
+
+func mapRegexHeaderValueToCondition(headerName string, headerValue string) (string, error) {
+	if err := validateOCIConditionLiteral("header match name", headerName); err != nil {
+		return "", err
 	}
-	if suffix, ewMatched := parseRegexForEndsWith(headerMatch.Value); ewMatched {
-		return fmt.Sprintf(`http.request.headers[(i '%s')][0] ew (i '%s')`, headerMatch.Name, suffix), nil
+	if prefix, swMatched := parseRegexForStartsWith(headerValue); swMatched {
+		return fmt.Sprintf(`http.request.headers[(i '%s')][0] sw (i '%s')`, headerName, prefix), nil
+	}
+	if suffix, ewMatched := parseRegexForEndsWith(headerValue); ewMatched {
+		return fmt.Sprintf(`http.request.headers[(i '%s')][0] ew (i '%s')`, headerName, suffix), nil
 	}
 	return "", fmt.Errorf(
 		"%w: regex header matching for header '%s'",
 		errUnsupportedMatch,
-		headerMatch.Name,
+		headerName,
 	)
 }
 
@@ -239,7 +307,7 @@ func (r *ociLoadBalancerRoutingRulesMapperImpl) mapHTTPRouteHostnamesAndMatchesT
 				continue
 			}
 			for _, matchCondition := range matchConditions {
-				conditions = append(conditions, "all("+hostCondition+", "+matchCondition+")")
+				conditions = append(conditions, allRoutingConditions(hostCondition, matchCondition))
 			}
 		}
 	}
@@ -310,9 +378,10 @@ func grpcContentTypeConditions() []string {
 }
 
 func allRoutingConditions(conditions ...string) string {
-	filteredConditions := lo.Filter(conditions, func(condition string, _ int) bool {
-		return condition != ""
-	})
+	filteredConditions := make([]string, 0, len(conditions))
+	for _, condition := range conditions {
+		filteredConditions = appendRoutingConditionParts(filteredConditions, condition)
+	}
 	if len(filteredConditions) == 0 {
 		return ""
 	}
@@ -320,6 +389,101 @@ func allRoutingConditions(conditions ...string) string {
 		return filteredConditions[0]
 	}
 	return "all(" + strings.Join(filteredConditions, ", ") + ")"
+}
+
+func appendRoutingConditionParts(conditions []string, condition string) []string {
+	if condition == "" {
+		return conditions
+	}
+	inner, ok := strings.CutPrefix(condition, "all(")
+	if !ok {
+		return append(conditions, condition)
+	}
+	inner, ok = strings.CutSuffix(inner, ")")
+	if !ok {
+		return append(conditions, condition)
+	}
+	parts, ok := splitOCIConditionArguments(inner)
+	if !ok {
+		return append(conditions, condition)
+	}
+	return append(conditions, parts...)
+}
+
+func splitOCIConditionArguments(value string) ([]string, bool) {
+	if value == "" {
+		return nil, false
+	}
+
+	var parts []string
+	start := 0
+	depth := 0
+	inLiteral := false
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		if char == '\'' {
+			inLiteral = !inLiteral
+			continue
+		}
+		if inLiteral {
+			continue
+		}
+
+		nextDepth, ok := updateOCIConditionDepth(depth, char)
+		if !ok {
+			return nil, false
+		}
+		depth = nextDepth
+		if char != ',' || depth != 0 {
+			continue
+		}
+
+		if !hasOCIConditionArgumentSeparator(value, index) {
+			return nil, false
+		}
+		var part string
+		part, ok = trimOCIConditionArgument(value[start:index])
+		if !ok {
+			return nil, false
+		}
+		parts = append(parts, part)
+		start = index + conditionArgumentSeparatorLength
+		index++
+	}
+	if inLiteral || depth != 0 {
+		return nil, false
+	}
+
+	part, ok := trimOCIConditionArgument(value[start:])
+	if !ok {
+		return nil, false
+	}
+	parts = append(parts, part)
+	return parts, true
+}
+
+func updateOCIConditionDepth(depth int, value byte) (int, bool) {
+	switch value {
+	case '(':
+		return depth + 1, true
+	case ')':
+		depth--
+		return depth, depth >= 0
+	default:
+		return depth, true
+	}
+}
+
+func hasOCIConditionArgumentSeparator(value string, index int) bool {
+	return index+1 < len(value) && value[index+1] == ' '
+}
+
+func trimOCIConditionArgument(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+	return value, true
 }
 
 func (r *ociLoadBalancerRoutingRulesMapperImpl) mapGRPCRouteMatchesToCondition(
@@ -407,6 +571,12 @@ func mapGRPCMethodMatchToCondition(methodMatch gatewayv1.GRPCMethodMatch) (strin
 
 	service := strings.TrimPrefix(lo.FromPtr(methodMatch.Service), ".")
 	method := lo.FromPtr(methodMatch.Method)
+	if err := validateOCIConditionLiteral("grpc service match value", service); err != nil {
+		return "", err
+	}
+	if err := validateOCIConditionLiteral("grpc method match value", method); err != nil {
+		return "", err
+	}
 	switch {
 	case service != "" && method != "":
 		return fmt.Sprintf(`http.request.url.path eq '/%s/%s'`, service, method), nil
@@ -424,7 +594,19 @@ func mapGRPCHeaderMatchToCondition(headerMatch gatewayv1.GRPCHeaderMatch) (strin
 	if headerMatch.Type != nil {
 		headerType = *headerMatch.Type
 	}
-	if headerType != gatewayv1.GRPCHeaderMatchExact {
+
+	switch headerType {
+	case gatewayv1.GRPCHeaderMatchExact:
+		if err := validateOCIConditionLiteral("grpc header match name", string(headerMatch.Name)); err != nil {
+			return "", err
+		}
+		if err := validateOCIConditionLiteral("grpc header match value", headerMatch.Value); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf(`http.request.headers[(i '%s')] eq (i '%s')`, headerMatch.Name, headerMatch.Value), nil
+	case gatewayv1.GRPCHeaderMatchRegularExpression:
+		return mapRegexHeaderValueToCondition(string(headerMatch.Name), headerMatch.Value)
+	default:
 		return "", fmt.Errorf(
 			"%w: unsupported grpc header match type '%s' for header '%s'",
 			errUnsupportedMatch,
@@ -432,6 +614,4 @@ func mapGRPCHeaderMatchToCondition(headerMatch gatewayv1.GRPCHeaderMatch) (strin
 			headerMatch.Name,
 		)
 	}
-
-	return fmt.Sprintf(`http.request.headers[(i '%s')] eq (i '%s')`, headerMatch.Name, headerMatch.Value), nil
 }

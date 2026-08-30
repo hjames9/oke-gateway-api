@@ -13,6 +13,61 @@ import (
 )
 
 func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
+	t.Run("parseRegexLiteral", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			value  string
+			want   string
+			wantOK bool
+		}{
+			{
+				name:   "rejects empty value",
+				value:  "",
+				wantOK: false,
+			},
+			{
+				name:   "rejects dangling escape",
+				value:  `api\`,
+				wantOK: false,
+			},
+			{
+				name:   "rejects unsupported escape",
+				value:  `api\-`,
+				wantOK: false,
+			},
+			{
+				name:   "rejects regex metacharacter",
+				value:  `api+`,
+				wantOK: false,
+			},
+			{
+				name:   "rejects single quote",
+				value:  `api'admin`,
+				wantOK: false,
+			},
+			{
+				name:   "rejects control character",
+				value:  "api\nadmin",
+				wantOK: false,
+			},
+			{
+				name:   "unescapes slash dot and backslash",
+				value:  `v1\/api\.example\\internal`,
+				want:   `v1/api.example\internal`,
+				wantOK: true,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				got, ok := parseRegexLiteral(tc.value)
+
+				assert.Equal(t, tc.wantOK, ok)
+				assert.Equal(t, tc.want, got)
+			})
+		}
+	})
+
 	t.Run("mapHTTPRouteMatchToCondition", func(t *testing.T) {
 		type testCase struct {
 			name        string
@@ -53,6 +108,20 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 			},
 			func() testCase {
 				fake := faker.New()
+				pathValue := "/" + fake.Lorem().Word() + "'bad"
+				return testCase{
+					name: "rejects path value with single quote",
+					match: gatewayv1.HTTPRouteMatch{
+						Path: &gatewayv1.HTTPPathMatch{
+							Type:  lo.ToPtr(gatewayv1.PathMatchExact),
+							Value: &pathValue,
+						},
+					},
+					wantErrIs: errUnsupportedMatch,
+				}
+			},
+			func() testCase {
+				fake := faker.New()
 				headerName := "X-" + fake.Lorem().Word()
 				headerValue := fake.UUID().V4()
 				return testCase{
@@ -67,6 +136,39 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 						},
 					},
 					want: fmt.Sprintf(`http.request.headers[(i '%s')] eq (i '%s')`, headerName, headerValue),
+				}
+			},
+			func() testCase {
+				fake := faker.New()
+				return testCase{
+					name: "rejects exact header name with single quote",
+					match: gatewayv1.HTTPRouteMatch{
+						Headers: []gatewayv1.HTTPHeaderMatch{
+							{
+								Type:  lo.ToPtr(gatewayv1.HeaderMatchExact),
+								Name:  gatewayv1.HTTPHeaderName("x-" + fake.Lorem().Word() + "'bad"),
+								Value: fake.UUID().V4(),
+							},
+						},
+					},
+					wantErrIs: errUnsupportedMatch,
+				}
+			},
+			func() testCase {
+				fake := faker.New()
+				headerName := "X-" + fake.Lorem().Word()
+				return testCase{
+					name: "rejects exact header value with control character",
+					match: gatewayv1.HTTPRouteMatch{
+						Headers: []gatewayv1.HTTPHeaderMatch{
+							{
+								Type:  lo.ToPtr(gatewayv1.HeaderMatchExact),
+								Name:  gatewayv1.HTTPHeaderName(headerName),
+								Value: "tenant\n" + fake.Lorem().Word(),
+							},
+						},
+					},
+					wantErrIs: errUnsupportedMatch,
 				}
 			},
 			func() testCase {
@@ -263,6 +365,36 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 				}
 			},
 			func() testCase {
+				return testCase{
+					name: "regex header match - starts with host prefix from issue",
+					match: gatewayv1.HTTPRouteMatch{
+						Headers: []gatewayv1.HTTPHeaderMatch{
+							{
+								Type:  lo.ToPtr(gatewayv1.HeaderMatchRegularExpression),
+								Name:  "Host",
+								Value: `^community-manager-api\..*$`,
+							},
+						},
+					},
+					want: `http.request.headers[(i 'Host')][0] sw (i 'community-manager-api.')`,
+				}
+			},
+			func() testCase {
+				return testCase{
+					name: "regex header match - starts with slash prefix",
+					match: gatewayv1.HTTPRouteMatch{
+						Headers: []gatewayv1.HTTPHeaderMatch{
+							{
+								Type:  lo.ToPtr(gatewayv1.HeaderMatchRegularExpression),
+								Name:  "X-API-Version",
+								Value: `^v1\/`,
+							},
+						},
+					},
+					want: `http.request.headers[(i 'X-API-Version')][0] sw (i 'v1/')`,
+				}
+			},
+			func() testCase {
 				fake := faker.New()
 				headerName := "X-" + fake.Lorem().Word()
 				return testCase{
@@ -299,6 +431,45 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 			func() testCase {
 				fake := faker.New()
 				headerName := "X-" + fake.Lorem().Word()
+				pathPrefix := fake.Lorem().Word()
+				pathSuffix := fake.Lorem().Word()
+				return testCase{
+					name: "regex header match - ends with escaped slash and backslash suffix",
+					match: gatewayv1.HTTPRouteMatch{
+						Headers: []gatewayv1.HTTPHeaderMatch{
+							{
+								Type:  lo.ToPtr(gatewayv1.HeaderMatchRegularExpression),
+								Name:  gatewayv1.HTTPHeaderName(headerName),
+								Value: fmt.Sprintf(`.*%s\/\\%s$`, pathPrefix, pathSuffix),
+							},
+						},
+					},
+					want: fmt.Sprintf(
+						`http.request.headers[(i '%s')][0] ew (i '%s/\%s')`,
+						headerName,
+						pathPrefix,
+						pathSuffix,
+					),
+				}
+			},
+			func() testCase {
+				return testCase{
+					name: "regex header match - rejects mixed prefix and suffix",
+					match: gatewayv1.HTTPRouteMatch{
+						Headers: []gatewayv1.HTTPHeaderMatch{
+							{
+								Type:  lo.ToPtr(gatewayv1.HeaderMatchRegularExpression),
+								Name:  "Host",
+								Value: `^api.*example\.com$`,
+							},
+						},
+					},
+					wantErrIs: errUnsupportedMatch,
+				}
+			},
+			func() testCase {
+				fake := faker.New()
+				headerName := "X-" + fake.Lorem().Word()
 				return testCase{
 					name: "regex header match - unsupported complex regex",
 					match: gatewayv1.HTTPRouteMatch{
@@ -307,6 +478,57 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 								Type:  lo.ToPtr(gatewayv1.HeaderMatchRegularExpression),
 								Name:  gatewayv1.HTTPHeaderName(headerName),
 								Value: "^[a-z]+$",
+							},
+						},
+					},
+					wantErrIs: errUnsupportedMatch,
+				}
+			},
+			func() testCase {
+				fake := faker.New()
+				headerName := "X-" + fake.Lorem().Word()
+				return testCase{
+					name: "regex header match - rejects single quote in translated prefix",
+					match: gatewayv1.HTTPRouteMatch{
+						Headers: []gatewayv1.HTTPHeaderMatch{
+							{
+								Type:  lo.ToPtr(gatewayv1.HeaderMatchRegularExpression),
+								Name:  gatewayv1.HTTPHeaderName(headerName),
+								Value: "^tenant'" + fake.Lorem().Word() + ".*",
+							},
+						},
+					},
+					wantErrIs: errUnsupportedMatch,
+				}
+			},
+			func() testCase {
+				fake := faker.New()
+				headerName := "X-" + fake.Lorem().Word()
+				return testCase{
+					name: "regex header match - rejects control character in translated suffix",
+					match: gatewayv1.HTTPRouteMatch{
+						Headers: []gatewayv1.HTTPHeaderMatch{
+							{
+								Type:  lo.ToPtr(gatewayv1.HeaderMatchRegularExpression),
+								Name:  gatewayv1.HTTPHeaderName(headerName),
+								Value: ".*tenant\n" + fake.Lorem().Word() + "$",
+							},
+						},
+					},
+					wantErrIs: errUnsupportedMatch,
+				}
+			},
+			func() testCase {
+				fake := faker.New()
+				headerName := "X-" + fake.Lorem().Word()
+				return testCase{
+					name: "regex header match - rejects unsafe header name",
+					match: gatewayv1.HTTPRouteMatch{
+						Headers: []gatewayv1.HTTPHeaderMatch{
+							{
+								Type:  lo.ToPtr(gatewayv1.HeaderMatchRegularExpression),
+								Name:  gatewayv1.HTTPHeaderName(headerName + "'bad"),
+								Value: "^tenant" + fake.Lorem().Word() + ".*",
 							},
 						},
 					},
@@ -719,6 +941,217 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 			)
 			assert.Equal(t, want, actual)
 		})
+
+		t.Run("flattens hostname with path and regex header conditions", func(t *testing.T) {
+			fake := faker.New()
+			hostname := gatewayv1.Hostname("api-" + fake.Internet().Domain())
+			pathValue := "/" + fake.Lorem().Word()
+			headerPrefix := "beta-" + fake.Lorem().Word()
+			headerName := gatewayv1.HTTPHeaderName("x-" + fake.Lorem().Word())
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			actual, err := rs.mapHTTPRouteHostnamesAndMatchesToCondition(
+				[]gatewayv1.Hostname{hostname},
+				0,
+				[]gatewayv1.HTTPRouteMatch{
+					{
+						Path: &gatewayv1.HTTPPathMatch{
+							Type:  lo.ToPtr(gatewayv1.PathMatchPathPrefix),
+							Value: &pathValue,
+						},
+						Headers: []gatewayv1.HTTPHeaderMatch{
+							{
+								Type:  lo.ToPtr(gatewayv1.HeaderMatchRegularExpression),
+								Name:  headerName,
+								Value: "^" + headerPrefix + ".*",
+							},
+						},
+					},
+				},
+			)
+
+			require.NoError(t, err)
+			want := fmt.Sprintf(
+				"any(all("+
+					"http.request.headers[(i 'host')] eq (i '%s'), "+
+					"http.request.url.path sw '%s', "+
+					"http.request.headers[(i '%s')][0] sw (i '%s')"+
+					"))",
+				hostname,
+				pathValue,
+				headerName,
+				headerPrefix,
+			)
+			assert.Equal(t, want, actual)
+			assert.NotContains(t, actual, "all(http.request.url.path")
+		})
+	})
+
+	t.Run("allRoutingConditions", func(t *testing.T) {
+		fake := faker.New()
+		hostCondition := fmt.Sprintf(
+			"http.request.headers[(i 'host')] eq (i '%s')",
+			"api-"+fake.Internet().Domain(),
+		)
+		pathCondition := fmt.Sprintf("http.request.url.path sw '/%s'", fake.Lorem().Word())
+		headerCondition := fmt.Sprintf(
+			"http.request.headers[(i 'accept')] eq (i '%s, %s')",
+			"text/"+fake.Lorem().Word(),
+			"application/"+fake.Lorem().Word(),
+		)
+		nestedCondition := fmt.Sprintf(
+			"any(%s, %s)",
+			fmt.Sprintf("http.request.headers[(i 'x-first')] eq (i '%s')", fake.UUID().V4()),
+			fmt.Sprintf("http.request.headers[(i 'x-second')] eq (i '%s')", fake.UUID().V4()),
+		)
+
+		tests := []struct {
+			name       string
+			conditions []string
+			want       string
+		}{
+			{
+				name: "flattens simple all condition",
+				conditions: []string{
+					hostCondition,
+					fmt.Sprintf("all(%s, %s)", pathCondition, nestedCondition),
+				},
+				want: fmt.Sprintf("all(%s, %s, %s)", hostCondition, pathCondition, nestedCondition),
+			},
+			{
+				name: "does not split comma inside literal",
+				conditions: []string{
+					hostCondition,
+					fmt.Sprintf("all(%s, %s)", pathCondition, headerCondition),
+				},
+				want: fmt.Sprintf("all(%s, %s, %s)", hostCondition, pathCondition, headerCondition),
+			},
+			{
+				name: "does not split comma inside nested condition",
+				conditions: []string{
+					hostCondition,
+					fmt.Sprintf("all(%s, %s)", nestedCondition, pathCondition),
+				},
+				want: fmt.Sprintf("all(%s, %s, %s)", hostCondition, nestedCondition, pathCondition),
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				assert.Equal(t, tc.want, allRoutingConditions(tc.conditions...))
+			})
+		}
+	})
+
+	t.Run("appendRoutingConditionParts", func(t *testing.T) {
+		fake := faker.New()
+		pathCondition := fmt.Sprintf("http.request.url.path sw '/%s'", fake.Lorem().Word())
+		headerCondition := fmt.Sprintf(
+			"http.request.headers[(i 'accept')] eq (i '%s, %s')",
+			"text/"+fake.Lorem().Word(),
+			"application/"+fake.Lorem().Word(),
+		)
+		nestedCondition := fmt.Sprintf(
+			"any(%s, %s)",
+			fmt.Sprintf("http.request.headers[(i 'x-first')] eq (i '%s')", fake.UUID().V4()),
+			fmt.Sprintf("http.request.headers[(i 'x-second')] eq (i '%s')", fake.UUID().V4()),
+		)
+
+		tests := []struct {
+			name      string
+			condition string
+			want      []string
+		}{
+			{
+				name:      "flattens simple all condition",
+				condition: fmt.Sprintf("all(%s, %s)", pathCondition, headerCondition),
+				want:      []string{pathCondition, headerCondition},
+			},
+			{
+				name:      "does not split comma inside literal",
+				condition: fmt.Sprintf("all(%s, %s)", headerCondition, pathCondition),
+				want:      []string{headerCondition, pathCondition},
+			},
+			{
+				name:      "does not split comma inside nested condition",
+				condition: fmt.Sprintf("all(%s, %s)", nestedCondition, pathCondition),
+				want:      []string{nestedCondition, pathCondition},
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				assert.Equal(t, tc.want, appendRoutingConditionParts(nil, tc.condition))
+			})
+		}
+	})
+
+	t.Run("splitOCIConditionArguments", func(t *testing.T) {
+		fake := faker.New()
+		firstCondition := fmt.Sprintf("http.request.url.path sw '/%s'", fake.Lorem().Word())
+		secondCondition := fmt.Sprintf(
+			"http.request.headers[(i 'x-%s')] eq (i '%s')",
+			fake.Lorem().Word(),
+			fake.UUID().V4(),
+		)
+
+		tests := []struct {
+			name   string
+			value  string
+			want   []string
+			wantOK bool
+		}{
+			{
+				name:   "splits top level arguments",
+				value:  fmt.Sprintf("%s, %s", firstCondition, secondCondition),
+				want:   []string{firstCondition, secondCondition},
+				wantOK: true,
+			},
+			{
+				name:   "rejects empty input",
+				value:  "",
+				wantOK: false,
+			},
+			{
+				name:   "rejects comma without following space",
+				value:  fmt.Sprintf("%s,%s", firstCondition, secondCondition),
+				wantOK: false,
+			},
+			{
+				name:   "rejects empty first argument",
+				value:  ", " + secondCondition,
+				wantOK: false,
+			},
+			{
+				name:   "rejects empty final argument",
+				value:  firstCondition + ", ",
+				wantOK: false,
+			},
+			{
+				name:   "rejects unmatched literal",
+				value:  fmt.Sprintf("%s, http.request.url.path sw '/%s", firstCondition, fake.Lorem().Word()),
+				wantOK: false,
+			},
+			{
+				name:   "rejects unbalanced open paren",
+				value:  fmt.Sprintf("any(%s, %s", firstCondition, secondCondition),
+				wantOK: false,
+			},
+			{
+				name:   "rejects unbalanced close paren",
+				value:  fmt.Sprintf("%s), %s", firstCondition, secondCondition),
+				wantOK: false,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				got, ok := splitOCIConditionArguments(tc.value)
+
+				assert.Equal(t, tc.wantOK, ok)
+				assert.Equal(t, tc.want, got)
+			})
+		}
 	})
 
 	t.Run("mapGRPCRouteHostnamesAndMatchesToCondition", func(t *testing.T) {
@@ -974,6 +1407,26 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 			require.ErrorIs(t, err, errUnsupportedMatch)
 		})
 
+		t.Run("rejects unsafe exact method matching", func(t *testing.T) {
+			fake := faker.New()
+			service := "svc'" + fake.Lorem().Word()
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			_, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				nil,
+				0,
+				[]gatewayv1.GRPCRouteMatch{
+					{
+						Method: &gatewayv1.GRPCMethodMatch{
+							Service: &service,
+						},
+					},
+				},
+			)
+
+			require.ErrorIs(t, err, errUnsupportedMatch)
+		})
+
 		t.Run("rejects regex header matching", func(t *testing.T) {
 			fake := faker.New()
 			headerType := gatewayv1.GRPCHeaderMatchRegularExpression
@@ -988,7 +1441,247 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 							{
 								Type:  &headerType,
 								Name:  gatewayv1.GRPCHeaderName("x-" + fake.Lorem().Word()),
-								Value: "^" + fake.Lorem().Word(),
+								Value: "^[a-z]+$",
+							},
+						},
+					},
+				},
+			)
+
+			require.ErrorIs(t, err, errUnsupportedMatch)
+		})
+
+		t.Run("maps regex host header matching", func(t *testing.T) {
+			headerType := gatewayv1.GRPCHeaderMatchRegularExpression
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			actual, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				nil,
+				0,
+				[]gatewayv1.GRPCRouteMatch{
+					{
+						Headers: []gatewayv1.GRPCHeaderMatch{
+							{
+								Type:  &headerType,
+								Name:  "Host",
+								Value: `^community-manager-api\..*$`,
+							},
+						},
+					},
+				},
+			)
+
+			require.NoError(t, err)
+			wantHeaderCondition := `http.request.headers[(i 'Host')][0] sw (i 'community-manager-api.')`
+			assert.Equal(t, fmt.Sprintf("any(%s)", grpcBranches(nil, wantHeaderCondition)), actual)
+		})
+
+		t.Run("maps regex non host header prefix matching", func(t *testing.T) {
+			headerType := gatewayv1.GRPCHeaderMatchRegularExpression
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			actual, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				nil,
+				0,
+				[]gatewayv1.GRPCRouteMatch{
+					{
+						Headers: []gatewayv1.GRPCHeaderMatch{
+							{
+								Type:  &headerType,
+								Name:  "X-API-Version",
+								Value: `^v1\/`,
+							},
+						},
+					},
+				},
+			)
+
+			require.NoError(t, err)
+			wantHeaderCondition := `http.request.headers[(i 'X-API-Version')][0] sw (i 'v1/')`
+			assert.Equal(t, fmt.Sprintf("any(%s)", grpcBranches(nil, wantHeaderCondition)), actual)
+		})
+
+		t.Run("maps regex non host header suffix matching", func(t *testing.T) {
+			headerType := gatewayv1.GRPCHeaderMatchRegularExpression
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			actual, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				nil,
+				0,
+				[]gatewayv1.GRPCRouteMatch{
+					{
+						Headers: []gatewayv1.GRPCHeaderMatch{
+							{
+								Type:  &headerType,
+								Name:  "X-Tenant",
+								Value: `-prod$`,
+							},
+						},
+					},
+				},
+			)
+
+			require.NoError(t, err)
+			wantHeaderCondition := `http.request.headers[(i 'X-Tenant')][0] ew (i '-prod')`
+			assert.Equal(t, fmt.Sprintf("any(%s)", grpcBranches(nil, wantHeaderCondition)), actual)
+		})
+
+		t.Run("rejects unsupported regex header matching", func(t *testing.T) {
+			headerType := gatewayv1.GRPCHeaderMatchRegularExpression
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			_, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				nil,
+				0,
+				[]gatewayv1.GRPCRouteMatch{
+					{
+						Headers: []gatewayv1.GRPCHeaderMatch{
+							{
+								Type:  &headerType,
+								Name:  "Host",
+								Value: `^api-[0-9]+\.example\.com$`,
+							},
+						},
+					},
+				},
+			)
+
+			require.ErrorIs(t, err, errUnsupportedMatch)
+		})
+
+		t.Run("rejects unsafe regex header matching", func(t *testing.T) {
+			fake := faker.New()
+			headerType := gatewayv1.GRPCHeaderMatchRegularExpression
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			_, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				nil,
+				0,
+				[]gatewayv1.GRPCRouteMatch{
+					{
+						Headers: []gatewayv1.GRPCHeaderMatch{
+							{
+								Type:  &headerType,
+								Name:  gatewayv1.GRPCHeaderName("x-" + fake.Lorem().Word()),
+								Value: ".*tenant'" + fake.Lorem().Word() + "$",
+							},
+						},
+					},
+				},
+			)
+
+			require.ErrorIs(t, err, errUnsupportedMatch)
+		})
+
+		t.Run("rejects unsafe exact header matching", func(t *testing.T) {
+			fake := faker.New()
+			headerType := gatewayv1.GRPCHeaderMatchExact
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			_, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				nil,
+				0,
+				[]gatewayv1.GRPCRouteMatch{
+					{
+						Headers: []gatewayv1.GRPCHeaderMatch{
+							{
+								Type:  &headerType,
+								Name:  gatewayv1.GRPCHeaderName("x-" + fake.Lorem().Word()),
+								Value: "tenant'" + fake.Lorem().Word(),
+							},
+						},
+					},
+				},
+			)
+
+			require.ErrorIs(t, err, errUnsupportedMatch)
+		})
+
+		t.Run("rejects unsafe regex header name", func(t *testing.T) {
+			fake := faker.New()
+			headerType := gatewayv1.GRPCHeaderMatchRegularExpression
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			_, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				nil,
+				0,
+				[]gatewayv1.GRPCRouteMatch{
+					{
+						Headers: []gatewayv1.GRPCHeaderMatch{
+							{
+								Type:  &headerType,
+								Name:  gatewayv1.GRPCHeaderName("x-" + fake.Lorem().Word() + "'bad"),
+								Value: "^tenant" + fake.Lorem().Word() + ".*",
+							},
+						},
+					},
+				},
+			)
+
+			require.ErrorIs(t, err, errUnsupportedMatch)
+		})
+
+		t.Run("flattens hostname with content type method and regex header conditions", func(t *testing.T) {
+			fake := faker.New()
+			hostname := gatewayv1.Hostname("grpc-" + fake.Internet().Domain())
+			service := "svc." + fake.Lorem().Word()
+			headerType := gatewayv1.GRPCHeaderMatchRegularExpression
+			headerName := gatewayv1.GRPCHeaderName("x-" + fake.Lorem().Word())
+			headerPrefix := "grpc-" + fake.Lorem().Word()
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			actual, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				[]gatewayv1.Hostname{hostname},
+				0,
+				[]gatewayv1.GRPCRouteMatch{
+					{
+						Method: &gatewayv1.GRPCMethodMatch{
+							Service: &service,
+						},
+						Headers: []gatewayv1.GRPCHeaderMatch{
+							{
+								Type:  &headerType,
+								Name:  headerName,
+								Value: "^" + headerPrefix + ".*",
+							},
+						},
+					},
+				},
+			)
+
+			require.NoError(t, err)
+			assert.Contains(
+				t,
+				actual,
+				fmt.Sprintf(
+					"all(http.request.headers[(i 'host')] eq (i '%s'), "+
+						"http.request.headers[(i 'content-type')][0] eq (i 'application/grpc'), "+
+						"http.request.url.path sw '/%s/', "+
+						"http.request.headers[(i '%s')][0] sw (i '%s'))",
+					hostname,
+					service,
+					headerName,
+					headerPrefix,
+				),
+			)
+			assert.NotContains(t, actual, "all(http.request.url.path")
+		})
+
+		t.Run("rejects unknown header match type", func(t *testing.T) {
+			fake := faker.New()
+			headerType := gatewayv1.GRPCHeaderMatchType("Unknown")
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			_, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				nil,
+				0,
+				[]gatewayv1.GRPCRouteMatch{
+					{
+						Headers: []gatewayv1.GRPCHeaderMatch{
+							{
+								Type:  &headerType,
+								Name:  gatewayv1.GRPCHeaderName("x-" + fake.Lorem().Word()),
+								Value: fake.Lorem().Word(),
 							},
 						},
 					},
