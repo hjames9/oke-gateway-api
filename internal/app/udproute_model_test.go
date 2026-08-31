@@ -3,10 +3,12 @@ package app
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 	"net/http"
 	"reflect"
 	"testing"
 
+	"github.com/jaswdr/faker/v2"
 	"github.com/oracle/oci-go-sdk/v65/networkloadbalancer"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
@@ -417,6 +419,74 @@ func TestUDPRouteModel(t *testing.T) {
 			matchedListener: gatewayv1.Listener{Name: "coap", Protocol: gatewayv1.UDPProtocolType, Port: 5684},
 		})
 		require.NoError(t, err)
+	})
+
+	t.Run("listener ownership includes ListenerSet parent refs", func(t *testing.T) {
+		fake := faker.New()
+		listenerSetKind := gatewayv1.Kind("ListenerSet")
+		listenerSetNamespace := gatewayv1.Namespace("apps")
+		listenerName := gatewayv1.SectionName("udp-" + fake.Lorem().Word())
+		listenerSet := gatewayv1.ListenerSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: string(listenerSetNamespace),
+				Name:      "extra-" + fake.Lorem().Word(),
+			},
+			Spec: gatewayv1.ListenerSetSpec{Listeners: []gatewayv1.ListenerEntry{{
+				Name:     listenerName,
+				Protocol: gatewayv1.UDPProtocolType,
+				Port:     5684,
+			}}},
+		}
+		gateway := gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "infra", Name: "edge-" + fake.Lorem().Word()},
+		}
+		effectiveListeners := effectiveListenersForGateway(gateway, []gatewayv1.ListenerSet{listenerSet})
+		matchedListener := effectiveListenerOCIListener(effectiveListeners[0])
+		currentRoute := gatewayv1.UDPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:         "apps",
+				Name:              "current-" + fake.Lorem().Word(),
+				CreationTimestamp: metav1.Unix(2, 0),
+			},
+			Spec: gatewayv1.UDPRouteSpec{CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{
+					Kind:        &listenerSetKind,
+					Namespace:   &listenerSetNamespace,
+					Name:        gatewayv1.ObjectName(listenerSet.Name),
+					SectionName: new(listenerName),
+				}},
+			}},
+		}
+		olderRoute := currentRoute.DeepCopy()
+		olderRoute.Name = "older-" + fake.Lorem().Word()
+		olderRoute.CreationTimestamp = metav1.Unix(1, 0)
+
+		mockClient := NewMockk8sClient(t)
+		mockClient.EXPECT().
+			List(t.Context(), mock.AnythingOfType("*v1.UDPRouteList")).
+			RunAndReturn(func(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
+				reflect.ValueOf(list).Elem().Set(reflect.ValueOf(gatewayv1.UDPRouteList{
+					Items: []gatewayv1.UDPRoute{currentRoute, *olderRoute},
+				}))
+				return nil
+			})
+		model := newUDPRouteModel(udpRouteModelDeps{RootLogger: diag.RootTestLogger(), K8sClient: mockClient})
+		modelImpl := mustUDPRouteModelImpl(t, model)
+
+		err := modelImpl.ensureExclusiveListenerOwner(t.Context(), resolvedUDPRouteDetails{
+			gatewayDetails:  resolvedGatewayDetails{gateway: gateway, effectiveListeners: effectiveListeners},
+			udpRoute:        currentRoute,
+			matchedListener: matchedListener,
+		})
+
+		var statusErr udpRouteStatusError
+		require.ErrorAs(t, err, &statusErr)
+		assert.Equal(t, gatewayv1.RouteReasonNotAllowedByListeners, statusErr.reason)
+		assert.Equal(
+			t,
+			"listener "+string(matchedListener.Name)+" already has an attached UDPRoute apps/"+olderRoute.Name,
+			statusErr.message,
+		)
 	})
 
 	t.Run("deprovisionRoute clears backend set and removes finalizer when no successor exists", func(t *testing.T) {
@@ -2122,6 +2192,183 @@ func TestUDPRouteModel(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("clearStaleBackendSets clears only undesired backend sets", func(t *testing.T) {
+		desiredBackendSet := "bs_coap"
+		staleBackendSet := "bs_old_coap"
+		route := gatewayv1.UDPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "iot",
+				Name:      "coap",
+				Annotations: map[string]string{
+					NetworkLoadBalancerUDPRouteProgrammedBackendSetsAnnotation: desiredBackendSet + "," + staleBackendSet,
+				},
+			},
+			Spec: gatewayv1.UDPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{{Name: "edge"}},
+				},
+			},
+		}
+		nlbClient := &stubNetworkLoadBalancerClient{}
+		model := newUDPRouteModel(udpRouteModelDeps{
+			RootLogger: diag.RootTestLogger(),
+			NetworkLoadBalancerModel: stubNetworkLoadBalancerGatewayModel{
+				networkLoadBalancer: networkloadbalancer.NetworkLoadBalancer{
+					Id: new("nlb-id"),
+					BackendSets: map[string]networkloadbalancer.BackendSet{
+						desiredBackendSet: {Name: &desiredBackendSet},
+						staleBackendSet:   {Name: &staleBackendSet},
+					},
+				},
+			},
+			OciNetworkLoadBalancerAPI: nlbClient,
+			WorkRequestsWatcher:       &stubWorkRequestsWatcher{},
+		})
+		modelImpl := mustUDPRouteModelImpl(t, model)
+
+		err := modelImpl.clearStaleBackendSets(t.Context(), resolvedUDPRouteDetails{
+			udpRoute: route,
+			gatewayDetails: resolvedGatewayDetails{
+				gateway: gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "iot", Name: "edge"},
+					Spec: gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{
+						{Name: "coap", Protocol: gatewayv1.UDPProtocolType, Port: 5684},
+					}},
+				},
+			},
+		})
+
+		require.NoError(t, err)
+		require.Len(t, nlbClient.updateBackendSetRequests, 1)
+		assert.Equal(t, staleBackendSet, lo.FromPtr(nlbClient.updateBackendSetRequests[0].BackendSetName))
+	})
+
+	t.Run("clearStaleBackendSets returns stale backend set cleanup errors", func(t *testing.T) {
+		route := gatewayv1.UDPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "iot",
+				Name:      "coap",
+				Annotations: map[string]string{
+					NetworkLoadBalancerUDPRouteProgrammedBackendSetsAnnotation: "bs_old_coap",
+				},
+			},
+			Spec: gatewayv1.UDPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{{Name: "edge"}},
+				},
+			},
+		}
+		backendSetName := "bs_old_coap"
+		model := newUDPRouteModel(udpRouteModelDeps{
+			RootLogger: diag.RootTestLogger(),
+			NetworkLoadBalancerModel: stubNetworkLoadBalancerGatewayModel{
+				networkLoadBalancer: networkloadbalancer.NetworkLoadBalancer{
+					Id: new("nlb-id"),
+					BackendSets: map[string]networkloadbalancer.BackendSet{
+						backendSetName: {Name: &backendSetName},
+					},
+				},
+			},
+			OciNetworkLoadBalancerAPI: &stubNetworkLoadBalancerClient{updateBackendSetErr: errors.New("clear failed")},
+			WorkRequestsWatcher:       &stubWorkRequestsWatcher{},
+		})
+		modelImpl := mustUDPRouteModelImpl(t, model)
+
+		err := modelImpl.clearStaleBackendSets(t.Context(), resolvedUDPRouteDetails{
+			udpRoute: route,
+			gatewayDetails: resolvedGatewayDetails{
+				gateway: gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "iot", Name: "edge"},
+				},
+			},
+		})
+
+		require.ErrorContains(t, err, "failed to clear Network Load Balancer backend set bs_old_coap")
+	})
+
+	t.Run("rejectNoMatchingListener ignores unresolved parent Gateway", func(t *testing.T) {
+		model := newUDPRouteModel(udpRouteModelDeps{
+			RootLogger: diag.RootTestLogger(),
+			K8sClient: fake.NewClientBuilder().
+				WithScheme(newL4TestScheme(t)).
+				Build(),
+		})
+		modelImpl := mustUDPRouteModelImpl(t, model)
+
+		err := modelImpl.rejectNoMatchingListener(t.Context(), gatewayv1.UDPRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "iot", Name: "coap"},
+		}, gatewayv1.ParentReference{Name: "edge"})
+
+		require.NoError(t, err)
+	})
+
+	t.Run("endpointBackendsForBackendRef ignores zero-weight backend refs", func(t *testing.T) {
+		zero := int32(0)
+		model := newUDPRouteModel(udpRouteModelDeps{
+			RootLogger: diag.RootTestLogger(),
+			K8sClient: fake.NewClientBuilder().
+				WithScheme(newL4TestScheme(t)).
+				Build(),
+		})
+		modelImpl := mustUDPRouteModelImpl(t, model)
+
+		backends, err := modelImpl.endpointBackendsForBackendRef(t.Context(), gatewayv1.UDPRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "iot", Name: "coap"},
+		}, gatewayv1.BackendRef{
+			BackendObjectReference: gatewayv1.BackendObjectReference{Name: "coap", Port: new(gatewayv1.PortNumber)},
+			Weight:                 &zero,
+		})
+
+		require.NoError(t, err)
+		assert.Empty(t, backends)
+	})
+
+	t.Run("removeDeletingRouteFinalizer returns update errors", func(t *testing.T) {
+		mockClient := NewMockk8sClient(t)
+		mockClient.EXPECT().
+			Update(t.Context(), mock.AnythingOfType("*v1.UDPRoute")).
+			Return(errors.New("update failed"))
+		model := newUDPRouteModel(udpRouteModelDeps{
+			RootLogger: diag.RootTestLogger(),
+			K8sClient:  mockClient,
+		})
+		modelImpl := mustUDPRouteModelImpl(t, model)
+
+		err := modelImpl.removeDeletingRouteFinalizer(t.Context(), gatewayv1.UDPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   "iot",
+				Name:        "coap",
+				Finalizers:  []string{NetworkLoadBalancerUDPRouteProgrammedFinalizer},
+				Annotations: map[string]string{L4RouteProgrammedNetworkLoadBalancerIDAnnotation: "nlb-id"},
+			},
+		})
+
+		require.ErrorContains(t, err, "failed to remove finalizer from deleting UDPRoute iot/coap")
+	})
+
+	t.Run("updateBackendSet returns Network Load Balancer ensure errors", func(t *testing.T) {
+		model := newUDPRouteModel(udpRouteModelDeps{
+			RootLogger:               diag.RootTestLogger(),
+			NetworkLoadBalancerModel: stubNetworkLoadBalancerGatewayModel{err: errors.New("ensure failed")},
+		})
+		modelImpl := mustUDPRouteModelImpl(t, model)
+
+		err := modelImpl.updateBackendSet(t.Context(), resolvedUDPRouteDetails{
+			udpRoute: gatewayv1.UDPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "iot",
+					Name:      "coap",
+					Annotations: map[string]string{
+						NetworkLoadBalancerUDPRouteHealthCheckPortAnnotation: "5684",
+					},
+				},
+			},
+			matchedListener: gatewayv1.Listener{Protocol: gatewayv1.UDPProtocolType},
+		}, "bs_coap", nil)
+
+		require.ErrorContains(t, err, "ensure failed")
+	})
+
 	t.Run("deprovisionDetachedRoute skips unresolved gateway references", func(t *testing.T) {
 		route := gatewayv1.UDPRoute{
 			ObjectMeta: metav1.ObjectMeta{
@@ -2191,5 +2438,51 @@ func TestUDPRouteModel(t *testing.T) {
 				require.NoError(t, err)
 			})
 		}
+	})
+
+	t.Run("udpBackendSetUsesHealthChecker requires matching TCP health checker", func(t *testing.T) {
+		port := 1024 + rand.IntN(64511)
+		otherPort := port - 1
+		if otherPort < 1 {
+			otherPort = port + 1
+		}
+		desiredHealthChecker := networkloadbalancer.HealthCheckerDetails{
+			Protocol: networkloadbalancer.HealthCheckProtocolsTcp,
+			Port:     &port,
+		}
+
+		require.True(t, udpBackendSetUsesHealthChecker(networkloadbalancer.BackendSet{
+			HealthChecker: &networkloadbalancer.HealthChecker{
+				Protocol: networkloadbalancer.HealthCheckProtocolsTcp,
+				Port:     &port,
+			},
+		}, desiredHealthChecker))
+		require.False(t, udpBackendSetUsesHealthChecker(networkloadbalancer.BackendSet{
+			HealthChecker: &networkloadbalancer.HealthChecker{
+				Protocol: networkloadbalancer.HealthCheckProtocolsUdp,
+				Port:     &port,
+			},
+		}, desiredHealthChecker))
+		require.False(t, udpBackendSetUsesHealthChecker(networkloadbalancer.BackendSet{
+			HealthChecker: &networkloadbalancer.HealthChecker{
+				Protocol: networkloadbalancer.HealthCheckProtocolsTcp,
+				Port:     &otherPort,
+			},
+		}, desiredHealthChecker))
+		require.True(t, udpBackendSetUsesHealthChecker(networkloadbalancer.BackendSet{
+			HealthChecker: &networkloadbalancer.HealthChecker{
+				Protocol: networkloadbalancer.HealthCheckProtocolsTcp,
+			},
+		}, networkloadbalancer.HealthCheckerDetails{
+			Protocol: networkloadbalancer.HealthCheckProtocolsTcp,
+		}))
+		require.False(t, udpBackendSetUsesHealthChecker(networkloadbalancer.BackendSet{
+			HealthChecker: &networkloadbalancer.HealthChecker{
+				Protocol: networkloadbalancer.HealthCheckProtocolsTcp,
+				Port:     &port,
+			},
+		}, networkloadbalancer.HealthCheckerDetails{
+			Protocol: networkloadbalancer.HealthCheckProtocolsTcp,
+		}))
 	})
 }

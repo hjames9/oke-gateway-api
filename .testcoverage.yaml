@@ -12,7 +12,7 @@ threshold:
 
   # (optional; default 0) 
   # The minimum total coverage project should have
-  total: 97
+  total: 99
 
 # Holds regexp rules which will exclude matched files or packages
 # from coverage statistics
@@ -25,5 +25,3 @@ exclude:
     - internal/api/http/v1routes/.* # Generated code
     - internal/app/models/.* # Generated code
     - internal/k8s/start_manager.go # Controller-runtime bootstrap wiring
-    - internal/services/k8sapi/client.go # Hard to test init code
-    - internal/services/ociapi/clients.go # Hard to test init code

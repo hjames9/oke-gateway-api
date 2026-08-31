@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	crfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	v1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -89,6 +90,29 @@ func TestListenerSetModel(t *testing.T) {
 		assert.False(t, ok)
 	})
 
+	t.Run("listenerSetParentGatewayTarget ignores malformed parent gateway names", func(t *testing.T) {
+		listenerSetKind := v1.Kind("ListenerSet")
+		listenerSet := makeListenerSet(func(listenerSet *v1.ListenerSet) {
+			listenerSet.Namespace = "apps-" + fake.Lorem().Word()
+			listenerSet.Name = "extra-" + fake.Lorem().Word()
+			listenerSet.Spec.ParentRef = v1.ParentGatewayReference{}
+		})
+		k8sClient := crfake.NewClientBuilder().
+			WithScheme(newL4TestScheme(t)).
+			WithObjects(&listenerSet).
+			Build()
+
+		_, resolved, err := listenerSetParentGatewayTarget(
+			t.Context(),
+			k8sClient,
+			listenerSet.Namespace,
+			v1.ParentReference{Kind: &listenerSetKind, Name: v1.ObjectName(listenerSet.Name)},
+		)
+
+		require.NoError(t, err)
+		assert.False(t, resolved)
+	})
+
 	t.Run("listenerSetAllowedByGateway", func(t *testing.T) {
 		listenerSet := makeListenerSet(func(listenerSet *v1.ListenerSet) {
 			listenerSet.Namespace = "apps-" + fake.Lorem().Word()
@@ -134,6 +158,9 @@ func TestListenerSetModel(t *testing.T) {
 				Values:   []string{"media"},
 			}},
 		}
+		assert.False(t, listenerSetAllowedByGateway(gateway, listenerSet, namespace))
+
+		gateway.Spec.AllowedListeners.Namespaces.From = lo.ToPtr(v1.NamespacesFromNone)
 		assert.False(t, listenerSetAllowedByGateway(gateway, listenerSet, namespace))
 
 		gateway.Spec.AllowedListeners.Namespaces.From = lo.ToPtr(v1.FromNamespaces("invalid"))
@@ -219,6 +246,13 @@ func TestListenerSetModel(t *testing.T) {
 		assert.Equal(t, v1.ListenerReasonHostnameConflict, got[2].conflictReason)
 		assert.True(t, got[3].conflicted)
 		assert.Equal(t, v1.ListenerReasonPortUnavailable, got[3].conflictReason)
+
+		reversed := effectiveListenersForGateway(gateway, []v1.ListenerSet{listenerSet1, listenerSet2, listenerSet3})
+		require.Len(t, reversed, 4)
+		assert.Equal(t, got[1].sourceNamespace, reversed[1].sourceNamespace)
+		assert.Equal(t, got[1].sourceName, reversed[1].sourceName)
+		assert.Equal(t, got[2].conflictReason, reversed[2].conflictReason)
+		assert.Equal(t, got[3].conflictReason, reversed[3].conflictReason)
 
 		conflictingProtocol := makeListenerSet(func(listenerSet *v1.ListenerSet) {
 			listenerSet.Namespace = "team-d"
@@ -308,6 +342,49 @@ func TestListenerSetModel(t *testing.T) {
 		))
 	})
 
+	t.Run("effective OCI listeners omit conflicted gateway listeners for each load balancer type", func(t *testing.T) {
+		tlsPassthroughMode := v1.TLSModePassthrough
+		tlsTerminateMode := v1.TLSModeTerminate
+		gateway := makeGateway(func(gateway *v1.Gateway) {
+			gateway.Namespace = "infra-" + fake.Lorem().Word()
+			gateway.Name = "edge-" + fake.Lorem().Word()
+			gateway.Spec.Listeners = []v1.Listener{
+				{Name: "http", Port: 80, Protocol: v1.HTTPProtocolType},
+				{Name: "grpc", Port: 80, Protocol: v1.HTTPProtocolType},
+				{Name: "rtmp", Port: 1935, Protocol: v1.TCPProtocolType},
+				{Name: "srt", Port: 1935, Protocol: v1.UDPProtocolType},
+				{
+					Name:     "rtmps",
+					Port:     443,
+					Protocol: v1.TLSProtocolType,
+					TLS:      &v1.ListenerTLSConfig{Mode: &tlsPassthroughMode},
+				},
+				{
+					Name:     "https",
+					Port:     8443,
+					Protocol: v1.TLSProtocolType,
+					TLS:      &v1.ListenerTLSConfig{Mode: &tlsTerminateMode},
+				},
+			}
+		})
+		details := resolvedGatewayDetails{
+			gateway:            gateway,
+			effectiveListeners: effectiveListenersForGateway(gateway, nil),
+		}
+
+		albListeners := gatewayManagedOCIListenersForLoadBalancer(&details)
+		nlbListeners := gatewayManagedOCIListenersForNetworkLoadBalancer(&details)
+
+		assert.Equal(t, []v1.SectionName{"http", "rtmp"}, lo.Map(
+			albListeners,
+			func(listener v1.Listener, _ int) v1.SectionName { return listener.Name },
+		))
+		assert.Equal(t, []v1.SectionName{"rtmp"}, lo.Map(
+			nlbListeners,
+			func(listener v1.Listener, _ int) v1.SectionName { return listener.Name },
+		))
+	})
+
 	t.Run("markConflictedEffectiveListeners skips already conflicted listeners", func(t *testing.T) {
 		listeners := []effectiveListener{
 			{
@@ -324,6 +401,48 @@ func TestListenerSetModel(t *testing.T) {
 		assert.True(t, listeners[0].conflicted)
 		assert.True(t, listeners[1].conflicted)
 		assert.Equal(t, v1.ListenerReasonProtocolConflict, listeners[1].conflictReason)
+	})
+
+	t.Run("effectiveListenersForGateway orders equal timestamp listenersets by name", func(t *testing.T) {
+		gateway := makeGateway(func(gateway *v1.Gateway) {
+			gateway.Namespace = "infra-" + fake.Lorem().Word()
+			gateway.Name = "edge-" + fake.Lorem().Word()
+			gateway.Spec.Listeners = nil
+		})
+		createdAt := metav1.NewTime(time.Now())
+		laterByName := makeListenerSet(func(listenerSet *v1.ListenerSet) {
+			listenerSet.Namespace = "team-b-" + fake.Lorem().Word()
+			listenerSet.Name = "extra-b-" + fake.Lorem().Word()
+			listenerSet.CreationTimestamp = createdAt
+			listenerSet.Spec.Listeners = []v1.ListenerEntry{{
+				Name:     "https",
+				Port:     443,
+				Protocol: v1.HTTPSProtocolType,
+				Hostname: lo.ToPtr(v1.Hostname("api.example.com")),
+			}}
+		})
+		earlierByName := makeListenerSet(func(listenerSet *v1.ListenerSet) {
+			listenerSet.Namespace = "team-a-" + fake.Lorem().Word()
+			listenerSet.Name = "extra-a-" + fake.Lorem().Word()
+			listenerSet.CreationTimestamp = createdAt
+			listenerSet.Spec.Listeners = []v1.ListenerEntry{{
+				Name:     "https",
+				Port:     443,
+				Protocol: v1.HTTPSProtocolType,
+				Hostname: lo.ToPtr(v1.Hostname("api.example.com")),
+			}}
+		})
+
+		got := effectiveListenersForGateway(gateway, []v1.ListenerSet{laterByName, earlierByName})
+
+		require.Len(t, got, 2)
+		assert.Equal(t, earlierByName.Namespace, got[0].sourceNamespace)
+		assert.Equal(t, earlierByName.Name, got[0].sourceName)
+		assert.False(t, got[0].conflicted)
+		assert.Equal(t, laterByName.Namespace, got[1].sourceNamespace)
+		assert.Equal(t, laterByName.Name, got[1].sourceName)
+		assert.True(t, got[1].conflicted)
+		assert.Equal(t, v1.ListenerReasonHostnameConflict, got[1].conflictReason)
 	})
 
 	t.Run("effectiveListenerOCIListener", func(t *testing.T) {
@@ -349,6 +468,28 @@ func TestListenerSetModel(t *testing.T) {
 		assert.Equal(t, v1.SectionName("ls_apps_edge_https"), got.Name)
 		assert.Equal(t, lo.ToPtr(v1.Namespace("apps")), got.TLS.CertificateRefs[0].Namespace)
 		assert.Nil(t, listener.listener.TLS.CertificateRefs[0].Namespace)
+
+		gatewayDetails := resolvedGatewayDetails{
+			gateway: makeGateway(func(gateway *v1.Gateway) {
+				gateway.Namespace = "infra"
+				gateway.Name = "edge"
+			}),
+			effectiveListeners: []effectiveListener{{
+				listener:        v1.Listener{Name: "https", Port: 443, Protocol: v1.HTTPSProtocolType},
+				sourceKind:      effectiveListenerSourceListenerSet,
+				sourceNamespace: "ignored",
+				sourceName:      "conflicted",
+				ociName:         "ls_apps_edge_https",
+				conflicted:      true,
+			}, {
+				listener:        v1.Listener{Name: "https", Port: 443, Protocol: v1.HTTPSProtocolType},
+				sourceKind:      effectiveListenerSourceListenerSet,
+				sourceNamespace: "apps",
+				sourceName:      "accepted",
+				ociName:         "ls_apps_edge_https",
+			}},
+		}
+		assert.Equal(t, "apps", effectiveListenerSourceNamespaceForOCIListener(gatewayDetails, got))
 	})
 
 	t.Run("listenerSetStatusForGateway", func(t *testing.T) {
@@ -400,9 +541,27 @@ func TestListenerSetModel(t *testing.T) {
 			Kind:  "GRPCRoute",
 		}}, got.Listeners[0].SupportedKinds)
 		assert.True(t, listenerSetStatusSemanticallyEqual(got, got))
+		reordered := got.DeepCopy()
+		if len(reordered.Conditions) > 1 {
+			reordered.Conditions[0], reordered.Conditions[1] = reordered.Conditions[1], reordered.Conditions[0]
+		}
+		if len(reordered.Listeners[0].Conditions) > 1 {
+			reordered.Listeners[0].Conditions[0], reordered.Listeners[0].Conditions[1] =
+				reordered.Listeners[0].Conditions[1], reordered.Listeners[0].Conditions[0]
+		}
+		assert.True(t, listenerSetStatusSemanticallyEqual(got, *reordered))
 
 		changed := got.DeepCopy()
 		changed.Listeners[0].Conditions[0].Reason = "Other"
+		assert.False(t, listenerSetStatusSemanticallyEqual(got, *changed))
+		changed = got.DeepCopy()
+		changed.Listeners[0].AttachedRoutes++
+		assert.False(t, listenerSetStatusSemanticallyEqual(got, *changed))
+		changed = got.DeepCopy()
+		changed.Listeners[0].Name = "other"
+		assert.False(t, listenerSetStatusSemanticallyEqual(got, *changed))
+		changed = got.DeepCopy()
+		changed.Listeners = append(changed.Listeners, v1.ListenerEntryStatus{Name: "extra"})
 		assert.False(t, listenerSetStatusSemanticallyEqual(got, *changed))
 
 		acceptedListenerSet := makeListenerSet(func(listenerSet *v1.ListenerSet) {
@@ -517,6 +676,20 @@ func TestListenerSetModel(t *testing.T) {
 		assert.Equal(t, metav1.ConditionFalse, httpAccepted.Status)
 		assert.Equal(t, string(v1.ListenerReasonUnsupportedProtocol), httpAccepted.Reason)
 
+		passthrough := v1.TLSModePassthrough
+		reason, message, unsupported := listenerSetListenerUnsupported(
+			v1.Listener{
+				Name:     "tls-passthrough",
+				Port:     9443,
+				Protocol: v1.TLSProtocolType,
+				TLS:      &v1.ListenerTLSConfig{Mode: &passthrough},
+			},
+			v1.GatewayController(NetworkLoadBalancerControllerClassName),
+		)
+		assert.False(t, unsupported)
+		assert.Empty(t, reason)
+		assert.Empty(t, message)
+
 		assert.False(t, listenerSetStatusSemanticallyEqual(got, status))
 		assert.False(t, routeGroupKindsEqual(status.Listeners[0].SupportedKinds, nil))
 		assert.False(t, routeGroupKindsEqual([]v1.RouteGroupKind{{
@@ -608,6 +781,15 @@ func TestListenerSetModel(t *testing.T) {
 			v1.ListenerEntryConditionReason(v1.ListenerReasonNoConflicts),
 			listenerEntryConflictedReason(effectiveListener{}),
 		)
+	})
+
+	t.Run("supportedRouteKindNamesForProtocol returns expected route kinds by listener protocol", func(t *testing.T) {
+		assert.Equal(t, []v1.Kind{"HTTPRoute", "GRPCRoute"}, supportedRouteKindNamesForProtocol(v1.HTTPProtocolType))
+		assert.Equal(t, []v1.Kind{"HTTPRoute", "GRPCRoute"}, supportedRouteKindNamesForProtocol(v1.HTTPSProtocolType))
+		assert.Equal(t, []v1.Kind{"TLSRoute"}, supportedRouteKindNamesForProtocol(v1.TLSProtocolType))
+		assert.Equal(t, []v1.Kind{"TCPRoute"}, supportedRouteKindNamesForProtocol(v1.TCPProtocolType))
+		assert.Equal(t, []v1.Kind{"UDPRoute"}, supportedRouteKindNamesForProtocol(v1.UDPProtocolType))
+		assert.Nil(t, supportedRouteKindNamesForProtocol(v1.ProtocolType("SCTP")))
 	})
 
 	t.Run("attachedListenerSetCount only counts sets with accepted effective listeners", func(t *testing.T) {

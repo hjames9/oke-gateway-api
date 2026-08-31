@@ -108,6 +108,20 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 			},
 			func() testCase {
 				fake := faker.New()
+				pathPrefix := "/" + fake.Lorem().Word() + "'bad"
+				return testCase{
+					name: "rejects prefix path value with single quote",
+					match: gatewayv1.HTTPRouteMatch{
+						Path: &gatewayv1.HTTPPathMatch{
+							Type:  lo.ToPtr(gatewayv1.PathMatchPathPrefix),
+							Value: &pathPrefix,
+						},
+					},
+					wantErrIs: errUnsupportedMatch,
+				}
+			},
+			func() testCase {
+				fake := faker.New()
 				pathValue := "/" + fake.Lorem().Word() + "'bad"
 				return testCase{
 					name: "rejects path value with single quote",
@@ -942,6 +956,36 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 			assert.Equal(t, want, actual)
 		})
 
+		t.Run("does not append listener port to wildcard or explicit port hostnames", func(t *testing.T) {
+			fake := faker.New()
+			wildcardHostname := gatewayv1.Hostname("*." + fake.Internet().Domain())
+			portHostname := gatewayv1.Hostname("api-" + fake.Internet().Domain() + ":8443")
+			listenerPort := 8000 + fake.Int32Between(1, 1000)
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			actual, err := rs.mapHTTPRouteHostnamesAndMatchesToCondition(
+				[]gatewayv1.Hostname{wildcardHostname, portHostname},
+				listenerPort,
+				nil,
+			)
+
+			require.NoError(t, err)
+			assert.Equal(
+				t,
+				fmt.Sprintf(
+					"any("+
+						"http.request.headers[(i 'host')] eq (i '%s'), "+
+						"http.request.headers[(i 'host')] eq (i '%s')"+
+						")",
+					wildcardHostname,
+					portHostname,
+				),
+				actual,
+			)
+			assert.NotContains(t, actual, fmt.Sprintf("%s:%d", wildcardHostname, listenerPort))
+			assert.NotContains(t, actual, fmt.Sprintf("%s:%d", portHostname, listenerPort))
+		})
+
 		t.Run("flattens hostname with path and regex header conditions", func(t *testing.T) {
 			fake := faker.New()
 			hostname := gatewayv1.Hostname("api-" + fake.Internet().Domain())
@@ -985,6 +1029,23 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 			assert.Equal(t, want, actual)
 			assert.NotContains(t, actual, "all(http.request.url.path")
 		})
+
+		t.Run("returns route match errors when hostnames are configured", func(t *testing.T) {
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			pathValue := "/api'bad"
+			_, err := rs.mapHTTPRouteHostnamesAndMatchesToCondition(
+				[]gatewayv1.Hostname{"api.example.com"},
+				443,
+				[]gatewayv1.HTTPRouteMatch{{
+					Path: &gatewayv1.HTTPPathMatch{
+						Type:  lo.ToPtr(gatewayv1.PathMatchPathPrefix),
+						Value: &pathValue,
+					},
+				}},
+			)
+
+			require.ErrorIs(t, err, errUnsupportedMatch)
+		})
 	})
 
 	t.Run("allRoutingConditions", func(t *testing.T) {
@@ -1010,6 +1071,15 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 			conditions []string
 			want       string
 		}{
+			{
+				name:       "returns empty condition when all inputs are empty",
+				conditions: []string{"", ""},
+			},
+			{
+				name:       "returns single condition without wrapping",
+				conditions: []string{"", pathCondition},
+				want:       pathCondition,
+			},
 			{
 				name: "flattens simple all condition",
 				conditions: []string{
@@ -1063,6 +1133,10 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 			want      []string
 		}{
 			{
+				name:      "ignores empty condition",
+				condition: "",
+			},
+			{
 				name:      "flattens simple all condition",
 				condition: fmt.Sprintf("all(%s, %s)", pathCondition, headerCondition),
 				want:      []string{pathCondition, headerCondition},
@@ -1076,6 +1150,16 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 				name:      "does not split comma inside nested condition",
 				condition: fmt.Sprintf("all(%s, %s)", nestedCondition, pathCondition),
 				want:      []string{nestedCondition, pathCondition},
+			},
+			{
+				name:      "keeps malformed all condition unchanged",
+				condition: fmt.Sprintf("all(%s, %s", nestedCondition, pathCondition),
+				want:      []string{fmt.Sprintf("all(%s, %s", nestedCondition, pathCondition)},
+			},
+			{
+				name:      "keeps all condition with invalid argument separator unchanged",
+				condition: fmt.Sprintf("all(%s,%s)", nestedCondition, pathCondition),
+				want:      []string{fmt.Sprintf("all(%s,%s)", nestedCondition, pathCondition)},
 			},
 		}
 
@@ -1141,6 +1225,22 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 				name:   "rejects unbalanced close paren",
 				value:  fmt.Sprintf("%s), %s", firstCondition, secondCondition),
 				wantOK: false,
+			},
+			{
+				name: "splits nested condition with quoted comma",
+				value: fmt.Sprintf(
+					"any(%s, http.request.headers[(i 'accept')] eq (i 'text/plain, application/json')), %s",
+					firstCondition,
+					secondCondition,
+				),
+				want: []string{
+					fmt.Sprintf(
+						"any(%s, http.request.headers[(i 'accept')] eq (i 'text/plain, application/json'))",
+						firstCondition,
+					),
+					secondCondition,
+				},
+				wantOK: true,
 			},
 		}
 
@@ -1353,6 +1453,35 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 			)
 		})
 
+		t.Run("does not append listener port to wildcard or explicit port grpc hostnames", func(t *testing.T) {
+			fake := faker.New()
+			wildcardHostname := gatewayv1.Hostname("*." + fake.Internet().Domain())
+			portHostname := gatewayv1.Hostname("grpc-" + fake.Internet().Domain() + ":9443")
+			listenerPort := 8000 + fake.Int32Between(1, 1000)
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			actual, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				[]gatewayv1.Hostname{wildcardHostname, portHostname},
+				listenerPort,
+				nil,
+			)
+
+			require.NoError(t, err)
+			wildcardHostCondition := fmt.Sprintf("http.request.headers[(i 'host')] eq (i '%s')", wildcardHostname)
+			portHostCondition := fmt.Sprintf("http.request.headers[(i 'host')] eq (i '%s')", portHostname)
+			assert.Equal(
+				t,
+				fmt.Sprintf(
+					"any(%s, %s)",
+					grpcBranches([]string{wildcardHostCondition}),
+					grpcBranches([]string{portHostCondition}),
+				),
+				actual,
+			)
+			assert.NotContains(t, actual, fmt.Sprintf("%s:%d", wildcardHostname, listenerPort))
+			assert.NotContains(t, actual, fmt.Sprintf("%s:%d", portHostname, listenerPort))
+		})
+
 		t.Run("returns native grpc content type condition when no grpc matches are configured", func(t *testing.T) {
 			rs := newOciLoadBalancerRoutingRulesMapper()
 
@@ -1419,6 +1548,28 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 					{
 						Method: &gatewayv1.GRPCMethodMatch{
 							Service: &service,
+						},
+					},
+				},
+			)
+
+			require.ErrorIs(t, err, errUnsupportedMatch)
+		})
+
+		t.Run("rejects unsafe exact method name matching", func(t *testing.T) {
+			fake := faker.New()
+			service := "svc." + fake.Lorem().Word()
+			method := "List'" + fake.Lorem().Word()
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			_, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				nil,
+				0,
+				[]gatewayv1.GRPCRouteMatch{
+					{
+						Method: &gatewayv1.GRPCMethodMatch{
+							Service: &service,
+							Method:  &method,
 						},
 					},
 				},
@@ -1588,6 +1739,30 @@ func TestOciLoadBalancerRoutingRulesMapper(t *testing.T) {
 								Type:  &headerType,
 								Name:  gatewayv1.GRPCHeaderName("x-" + fake.Lorem().Word()),
 								Value: "tenant'" + fake.Lorem().Word(),
+							},
+						},
+					},
+				},
+			)
+
+			require.ErrorIs(t, err, errUnsupportedMatch)
+		})
+
+		t.Run("rejects unsafe exact header name", func(t *testing.T) {
+			fake := faker.New()
+			headerType := gatewayv1.GRPCHeaderMatchExact
+
+			rs := newOciLoadBalancerRoutingRulesMapper()
+			_, err := rs.mapGRPCRouteHostnamesAndMatchesToCondition(
+				nil,
+				0,
+				[]gatewayv1.GRPCRouteMatch{
+					{
+						Headers: []gatewayv1.GRPCHeaderMatch{
+							{
+								Type:  &headerType,
+								Name:  gatewayv1.GRPCHeaderName("x-" + fake.Lorem().Word() + "'bad"),
+								Value: fake.UUID().V4(),
 							},
 						},
 					},

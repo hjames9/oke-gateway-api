@@ -67,6 +67,31 @@ func TestOciLoadBalancerModelImpl(t *testing.T) {
 				Protocol: &protocol,
 				Port:     &port,
 			}))
+			assert.False(t, loadBalancerHealthCheckerMatches(&loadbalancer.HealthChecker{
+				Protocol: new("HTTP"),
+				Port:     &port,
+			}, loadbalancer.HealthCheckerDetails{
+				Protocol: &protocol,
+				Port:     &port,
+			}))
+			assert.True(t, loadBalancerHealthCheckerMatches(&loadbalancer.HealthChecker{
+				Protocol: &protocol,
+				Port:     &port,
+			}, loadbalancer.HealthCheckerDetails{
+				Protocol: &protocol,
+				Port:     &port,
+			}))
+			assert.True(t, loadBalancerBackendSetMatches(
+				loadbalancer.BackendSet{
+					Policy: new("ROUND_ROBIN"),
+					HealthChecker: &loadbalancer.HealthChecker{
+						Protocol: &protocol,
+						Port:     &port,
+					},
+				},
+				"ROUND_ROBIN",
+				loadbalancer.HealthCheckerDetails{Protocol: &protocol, Port: &port},
+			))
 			assert.False(t, loadBalancerBackendSetMatches(
 				loadbalancer.BackendSet{
 					Policy: new("IP_HASH"),
@@ -120,6 +145,8 @@ func TestOciLoadBalancerModelImpl(t *testing.T) {
 			got := sslConfigurationDetailsFromBackendSet(&config)
 
 			require.NotNil(t, got)
+			assert.Nil(t, firstSSLConfig(nil))
+			assert.Equal(t, got, firstSSLConfig([]*loadbalancer.SslConfigurationDetails{got}))
 			assert.Equal(t, config.VerifyDepth, got.VerifyDepth)
 			assert.Equal(t, config.VerifyPeerCertificate, got.VerifyPeerCertificate)
 			assert.Equal(t, config.HasSessionResumption, got.HasSessionResumption)
@@ -129,6 +156,119 @@ func TestOciLoadBalancerModelImpl(t *testing.T) {
 			assert.Equal(t, config.Protocols, got.Protocols)
 			assert.Equal(t, config.CipherSuiteName, got.CipherSuiteName)
 			assert.Equal(t, loadbalancer.SslConfigurationDetailsServerOrderPreferenceEnabled, got.ServerOrderPreference)
+		})
+
+		t.Run("compares listener ssl config drift with optional desired fields", func(t *testing.T) {
+			fake := faker.New()
+			base := &loadbalancer.SslConfigurationDetails{
+				CertificateName: new("cert-" + fake.Lorem().Word()),
+				CertificateIds: []string{
+					"ocid1.certificate.oc1.." + fake.UUID().V4(),
+					"ocid1.certificate.oc1.." + fake.UUID().V4(),
+				},
+				CipherSuiteName:       new("cipher-" + fake.Lorem().Word()),
+				Protocols:             []string{"TLSv1.2", "TLSv1.3"},
+				VerifyPeerCertificate: new(true),
+				VerifyDepth:           new(4),
+				TrustedCertificateAuthorityIds: []string{
+					"ocid1.cabundle.oc1.." + fake.UUID().V4(),
+					"ocid1.cabundle.oc1.." + fake.UUID().V4(),
+				},
+			}
+			clone := func() *loadbalancer.SslConfigurationDetails {
+				return &loadbalancer.SslConfigurationDetails{
+					CertificateName:                base.CertificateName,
+					CertificateIds:                 slices.Clone(base.CertificateIds),
+					CipherSuiteName:                base.CipherSuiteName,
+					Protocols:                      slices.Clone(base.Protocols),
+					VerifyPeerCertificate:          base.VerifyPeerCertificate,
+					VerifyDepth:                    base.VerifyDepth,
+					TrustedCertificateAuthorityIds: slices.Clone(base.TrustedCertificateAuthorityIds),
+				}
+			}
+
+			assert.True(t, loadBalancerListenerSSLConfigurationsEqual(clone(), clone()))
+			assert.False(t, loadBalancerListenerSSLConfigurationsEqual(
+				clone(),
+				&loadbalancer.SslConfigurationDetails{
+					CertificateName:       base.CertificateName,
+					CertificateIds:        slices.Clone(base.CertificateIds),
+					VerifyPeerCertificate: base.VerifyPeerCertificate,
+				},
+			))
+			assert.True(t, loadBalancerListenerSSLConfigurationsEqual(
+				&loadbalancer.SslConfigurationDetails{
+					CertificateName:                base.CertificateName,
+					CertificateIds:                 []string{base.CertificateIds[0]},
+					TrustedCertificateAuthorityIds: []string{base.TrustedCertificateAuthorityIds[0]},
+					VerifyPeerCertificate:          base.VerifyPeerCertificate,
+				},
+				&loadbalancer.SslConfigurationDetails{
+					CertificateName:                base.CertificateName,
+					CertificateIds:                 []string{base.CertificateIds[0]},
+					TrustedCertificateAuthorityIds: []string{base.TrustedCertificateAuthorityIds[0]},
+					VerifyPeerCertificate:          base.VerifyPeerCertificate,
+				},
+			))
+			reorderedCurrent := clone()
+			slices.Reverse(reorderedCurrent.CertificateIds)
+			slices.Reverse(reorderedCurrent.Protocols)
+			slices.Reverse(reorderedCurrent.TrustedCertificateAuthorityIds)
+			assert.True(t, loadBalancerListenerSSLConfigurationsEqual(reorderedCurrent, clone()))
+			assert.True(t, loadBalancerSSLConfigurationsEqual(reorderedCurrent, clone()))
+			assert.False(t, loadBalancerListenerSSLConfigurationsEqual(nil, clone()))
+			assert.False(t, loadBalancerListenerSSLConfigurationsEqual(clone(), nil))
+			assert.False(t, loadBalancerSSLConfigurationsEqual(nil, clone()))
+			assert.False(t, loadBalancerSSLConfigurationsEqual(clone(), nil))
+
+			changedCertName := clone()
+			changedCertName.CertificateName = new("cert-other-" + fake.Lorem().Word())
+			assert.False(t, loadBalancerListenerSSLConfigurationsEqual(changedCertName, clone()))
+			assert.False(t, loadBalancerSSLConfigurationsEqual(changedCertName, clone()))
+
+			changedCertID := clone()
+			changedCertID.CertificateIds = []string{"ocid1.certificate.oc1.." + fake.UUID().V4()}
+			assert.False(t, loadBalancerListenerSSLConfigurationsEqual(changedCertID, clone()))
+			assert.False(t, loadBalancerSSLConfigurationsEqual(changedCertID, clone()))
+
+			changedCipher := clone()
+			changedCipher.CipherSuiteName = new("cipher-other-" + fake.Lorem().Word())
+			assert.False(t, loadBalancerListenerSSLConfigurationsEqual(changedCipher, clone()))
+			assert.False(t, loadBalancerSSLConfigurationsEqual(changedCipher, clone()))
+
+			changedProtocols := clone()
+			changedProtocols.Protocols = []string{"TLSv1.1"}
+			assert.False(t, loadBalancerListenerSSLConfigurationsEqual(changedProtocols, clone()))
+			assert.False(t, loadBalancerSSLConfigurationsEqual(changedProtocols, clone()))
+
+			changedPeerVerification := clone()
+			changedPeerVerification.VerifyPeerCertificate = new(false)
+			assert.False(t, loadBalancerListenerSSLConfigurationsEqual(changedPeerVerification, clone()))
+			assert.False(t, loadBalancerSSLConfigurationsEqual(changedPeerVerification, clone()))
+
+			changedVerifyDepth := clone()
+			changedVerifyDepth.VerifyDepth = new(2)
+			assert.False(t, loadBalancerListenerSSLConfigurationsEqual(changedVerifyDepth, clone()))
+			assert.False(t, loadBalancerSSLConfigurationsEqual(changedVerifyDepth, clone()))
+
+			changedSessionResumption := clone()
+			changedHasSessionResumption := !lo.FromPtr(changedSessionResumption.HasSessionResumption)
+			changedSessionResumption.HasSessionResumption = &changedHasSessionResumption
+			assert.True(t, loadBalancerListenerSSLConfigurationsEqual(changedSessionResumption, clone()))
+			assert.False(t, loadBalancerSSLConfigurationsEqual(changedSessionResumption, clone()))
+
+			changedServerOrder := clone()
+			changedServerOrder.ServerOrderPreference = loadbalancer.SslConfigurationDetailsServerOrderPreferenceDisabled
+			if clone().ServerOrderPreference == loadbalancer.SslConfigurationDetailsServerOrderPreferenceDisabled {
+				changedServerOrder.ServerOrderPreference = loadbalancer.SslConfigurationDetailsServerOrderPreferenceEnabled
+			}
+			assert.True(t, loadBalancerListenerSSLConfigurationsEqual(changedServerOrder, clone()))
+			assert.False(t, loadBalancerSSLConfigurationsEqual(changedServerOrder, clone()))
+
+			changedTrustedCA := clone()
+			changedTrustedCA.TrustedCertificateAuthorityIds = []string{"ocid1.cabundle.oc1.." + fake.UUID().V4()}
+			assert.False(t, loadBalancerListenerSSLConfigurationsEqual(changedTrustedCA, clone()))
+			assert.False(t, loadBalancerSSLConfigurationsEqual(changedTrustedCA, clone()))
 		})
 
 		t.Run("detects routing default rule shape", func(t *testing.T) {
@@ -147,6 +287,10 @@ func TestOciLoadBalancerModelImpl(t *testing.T) {
 			})
 			assert.True(t, routingPolicyDefaultRuleDrifted(loadbalancer.RoutingPolicy{
 				Rules: []loadbalancer.RoutingRule{driftedDefaultRule},
+			}, defaultBackendSetName))
+			wrongBackendDefaultRule := defaultCatchAllRoutingRule("other-" + fake.Lorem().Word())
+			assert.True(t, routingPolicyDefaultRuleDrifted(loadbalancer.RoutingPolicy{
+				Rules: []loadbalancer.RoutingRule{wrongBackendDefaultRule},
 			}, defaultBackendSetName))
 			assert.False(t, routingPolicyDefaultRuleDrifted(loadbalancer.RoutingPolicy{
 				Rules: []loadbalancer.RoutingRule{defaultCatchAllRoutingRule(defaultBackendSetName)},
@@ -174,6 +318,34 @@ func TestOciLoadBalancerModelImpl(t *testing.T) {
 				ociListenerPolicyRuleNameFromParts(0, "grpc", route.Namespace, route.Name),
 				got,
 			)
+		})
+
+		t.Run("keeps http and grpc policy rule names distinct for same route identity", func(t *testing.T) {
+			fake := faker.New()
+			namespace := "routes-" + fake.Lorem().Word()
+			routeName := "api-" + fake.Lorem().Word()
+			ruleName := gatewayv1.SectionName("root-" + fake.Lorem().Word())
+			httpRoute := makeRandomHTTPRoute(
+				randomHTTPRouteWithNamespaceOpt(namespace),
+				randomHTTPRouteWithNameOpt(routeName),
+				randomHTTPRouteWithRulesOpt(makeRandomHTTPRouteRule(func(rule *gatewayv1.HTTPRouteRule) {
+					rule.Name = &ruleName
+				})),
+			)
+			grpcRoute := makeRandomGRPCRoute(randomGRPCRouteWithRulesOpt(
+				makeRandomGRPCRouteRule(func(rule *gatewayv1.GRPCRouteRule) {
+					rule.Name = &ruleName
+				}),
+			))
+			grpcRoute.Namespace = namespace
+			grpcRoute.Name = routeName
+
+			httpRuleName := ociListerPolicyRuleName(httpRoute, 0)
+			grpcRuleName := ociGRPCListenerPolicyRuleName(grpcRoute, 0)
+
+			assert.NotEqual(t, httpRuleName, grpcRuleName)
+			assert.True(t, isValidOCIRoutingPolicyName(httpRuleName))
+			assert.True(t, isValidOCIRoutingPolicyName(grpcRuleName))
 		})
 	})
 
@@ -2002,6 +2174,51 @@ func TestOciLoadBalancerModelImpl(t *testing.T) {
 			ociLoadBalancerClient.AssertNotCalled(t, "CreateListener")
 		})
 
+		t.Run("fails when routing policy default rule update wait fails", func(t *testing.T) {
+			fake := faker.New()
+			deps := makeMockDeps(t)
+			model := newOciLoadBalancerModel(deps)
+			gwListener := makeRandomListener(
+				randomListenerWithHTTPProtocolOpt(),
+			)
+
+			routingPolicyName := listenerPolicyName(string(gwListener.Name))
+			existingPolicy := loadbalancer.RoutingPolicy{
+				Name:                     new(routingPolicyName),
+				ConditionLanguageVersion: loadbalancer.RoutingPolicyConditionLanguageVersionV1,
+				Rules:                    []loadbalancer.RoutingRule{defaultCatchAllRoutingRule(fake.UUID().V4())},
+			}
+			params := reconcileHTTPListenerParams{
+				loadBalancerID: fake.UUID().V4(),
+				knownRoutingPolicies: map[string]loadbalancer.RoutingPolicy{
+					routingPolicyName: existingPolicy,
+				},
+				defaultBackendSetName: fake.UUID().V4(),
+				listenerSpec:          &gwListener,
+			}
+			workRequestID := fake.UUID().V4()
+			wantErr := errors.New("wait failed")
+
+			ociLoadBalancerClient, _ := deps.OciClient.(*MockociLoadBalancerClient)
+			workRequestsWatcher, _ := deps.WorkRequestsWatcher.(*MockworkRequestsWatcher)
+			ociLoadBalancerClient.EXPECT().GetRoutingPolicy(t.Context(), loadbalancer.GetRoutingPolicyRequest{
+				LoadBalancerId:    &params.loadBalancerID,
+				RoutingPolicyName: &routingPolicyName,
+			}).Return(loadbalancer.GetRoutingPolicyResponse{
+				RoutingPolicy: existingPolicy,
+			}, nil)
+			ociLoadBalancerClient.EXPECT().
+				UpdateRoutingPolicy(t.Context(), mock.Anything).
+				Return(loadbalancer.UpdateRoutingPolicyResponse{OpcWorkRequestId: &workRequestID}, nil)
+			workRequestsWatcher.EXPECT().WaitFor(t.Context(), workRequestID).Return(wantErr)
+
+			err := model.reconcileHTTPListener(t.Context(), params)
+
+			require.ErrorIs(t, err, wantErr)
+			require.ErrorContains(t, err, "failed to wait for routing policy")
+			ociLoadBalancerClient.AssertNotCalled(t, "CreateListener")
+		})
+
 		t.Run("when create routing policy fails", func(t *testing.T) {
 			fake := faker.New()
 			deps := makeMockDeps(t)
@@ -2197,6 +2414,8 @@ func TestOciLoadBalancerModelImpl(t *testing.T) {
 			backendRef.Port = nil
 			service.Spec.Ports[0].TargetPort = intstr.FromInt(int(targetPort))
 			assert.Equal(t, int(targetPort), healthCheckerPortForBackendRef(service, backendRef))
+			service.Spec.Ports[0].TargetPort = intstr.FromInt(0)
+			assert.Equal(t, int(servicePort), healthCheckerPortForBackendRef(service, backendRef))
 			assert.Equal(t, 0, healthCheckerPortForBackendRef(corev1.Service{}, gatewayv1.BackendRef{}))
 		})
 
@@ -4797,6 +5016,42 @@ func TestOciLoadBalancerModelImpl(t *testing.T) {
 			return cert
 		}
 
+		t.Run("extracts unique listener certificate names", func(t *testing.T) {
+			firstCert := makeRandomOCICertificate()
+			secondCert := makeRandomOCICertificate()
+
+			got := certificateNamesFromListenerCertificates(map[string][]loadbalancer.Certificate{
+				"listener-a": {firstCert, {CertificateName: nil}, secondCert},
+				"listener-b": {firstCert},
+			})
+
+			assert.ElementsMatch(t, []string{
+				lo.FromPtr(firstCert.CertificateName),
+				lo.FromPtr(secondCert.CertificateName),
+			}, got)
+		})
+
+		t.Run("extracts certificate names deterministically across listener order", func(t *testing.T) {
+			fake := faker.New()
+			firstCertName := "cert-a-" + fake.UUID().V4()
+			secondCertName := "cert-b-" + fake.UUID().V4()
+			thirdCertName := "cert-c-" + fake.UUID().V4()
+			firstCert := loadbalancer.Certificate{CertificateName: new(firstCertName)}
+			secondCert := loadbalancer.Certificate{CertificateName: new(secondCertName)}
+			thirdCert := loadbalancer.Certificate{CertificateName: new(thirdCertName)}
+
+			got := certificateNamesFromListenerCertificates(map[string][]loadbalancer.Certificate{
+				"listener-b": {thirdCert, firstCert},
+				"listener-a": {secondCert, firstCert},
+			})
+
+			assert.Equal(t, []string{firstCertName, secondCertName, thirdCertName}, got)
+			assert.Equal(t, got, certificateNamesFromListenerCertificates(map[string][]loadbalancer.Certificate{
+				"listener-a": {firstCert, secondCert},
+				"listener-b": {firstCert, thirdCert},
+			}))
+		})
+
 		t.Run("no certificates to remove", func(t *testing.T) {
 			fake := faker.New()
 			deps := makeMockDeps(t)
@@ -6358,6 +6613,53 @@ func Test_ociListerPolicyRuleName(t *testing.T) {
 	})
 }
 
+func Test_ociBackendSetNameFromBackendObjectRef(t *testing.T) {
+	t.Run("includes backend port in identity", func(t *testing.T) {
+		fake := faker.New()
+		namespace := "apps" + fake.Numerify("###")
+		backendName := gatewayv1.ObjectName("svc" + fake.Numerify("###"))
+		oldPort := gatewayv1.PortNumber(fake.IntBetween(1024, 32767))
+		newPort := gatewayv1.PortNumber(fake.IntBetween(32768, 65535))
+
+		oldName := ociBackendSetNameFromBackendObjectRef(namespace, gatewayv1.BackendObjectReference{
+			Name: backendName,
+			Port: &oldPort,
+		})
+		newName := ociBackendSetNameFromBackendObjectRef(namespace, gatewayv1.BackendObjectReference{
+			Name: backendName,
+			Port: &newPort,
+		})
+
+		assert.NotEqual(t, oldName, newName)
+		assert.Contains(t, oldName, fmt.Sprintf("-%d", oldPort))
+		assert.Contains(t, newName, fmt.Sprintf("-%d", newPort))
+		assert.LessOrEqual(t, len(oldName), maxBackendSetNameLength)
+		assert.LessOrEqual(t, len(newName), maxBackendSetNameLength)
+	})
+
+	t.Run("defaults backend namespace before constructing identity", func(t *testing.T) {
+		fake := faker.New()
+		defaultNamespace := "default" + fake.Numerify("###")
+		explicitNamespace := gatewayv1.Namespace("explicit" + fake.Numerify("###"))
+		backendName := gatewayv1.ObjectName("svc" + fake.Numerify("###"))
+		port := gatewayv1.PortNumber(fake.IntBetween(1024, 65535))
+
+		defaulted := ociBackendSetNameFromBackendObjectRef(defaultNamespace, gatewayv1.BackendObjectReference{
+			Name: backendName,
+			Port: &port,
+		})
+		explicit := ociBackendSetNameFromBackendObjectRef(defaultNamespace, gatewayv1.BackendObjectReference{
+			Namespace: &explicitNamespace,
+			Name:      backendName,
+			Port:      &port,
+		})
+
+		assert.NotEqual(t, defaulted, explicit)
+		assert.Contains(t, defaulted, defaultNamespace)
+		assert.Contains(t, explicit, string(explicitNamespace))
+	})
+}
+
 func Test_listenerPolicyName(t *testing.T) {
 	t.Run("preserves existing valid listener policy names", func(t *testing.T) {
 		fake := faker.New()
@@ -6420,6 +6722,160 @@ func Test_listenerPolicyName(t *testing.T) {
 		assert.True(t, isValidOCIRoutingPolicyName(got))
 		assert.True(t, isValidOCIRoutingPolicyName(other))
 		assert.NotEqual(t, got, other)
+	})
+
+	t.Run("always returns deterministic OCI safe names for unsafe inputs", func(t *testing.T) {
+		fake := faker.New()
+		listenerNames := []string{
+			"valid_" + fake.Numerify("########"),
+			"hyphen-" + fake.Numerify("########"),
+			"dot." + fake.Numerify("########"),
+			"slash/" + fake.Numerify("########"),
+			"space " + fake.Numerify("########"),
+			"9digit_" + fake.Numerify("########"),
+			"long-" + fake.Numerify("################################################"),
+		}
+		seen := map[string]string{}
+
+		for _, listenerName := range listenerNames {
+			got := listenerPolicyName(listenerName)
+			assert.Equal(t, got, listenerPolicyName(listenerName))
+			assert.True(t, isValidOCIRoutingPolicyName(got))
+			assert.False(t, invalidCharsForPolicyNamePattern.MatchString(got))
+			assert.LessOrEqual(t, len(got), maxListenerPolicyNameLength)
+
+			previousInput, exists := seen[got]
+			assert.False(
+				t,
+				exists,
+				"listener names %q and %q generated the same OCI policy name %q",
+				previousInput,
+				listenerName,
+				got,
+			)
+			seen[got] = listenerName
+		}
+	})
+}
+
+func Test_sortRoutingRules(t *testing.T) {
+	t.Run("keeps native grpc rules before http rules and catch all last", func(t *testing.T) {
+		fake := faker.New()
+		httpRuleName := "p0010_" + fake.Numerify("########") + "_http"
+		grpcRuleName := "p0011_" + fake.Numerify("########") + "_grpc"
+		firstHTTPRuleName := "p0001_" + fake.Numerify("########") + "_http"
+		httpCondition := "any(http.request.url.path sw '/')"
+		grpcCondition := "any(http.request.headers[(i 'content-type')][0] eq (i 'application/grpc'))"
+
+		rules := []loadbalancer.RoutingRule{
+			{Name: new(defaultCatchAllRuleName), Condition: new(httpCondition)},
+			{Name: new(httpRuleName), Condition: new(httpCondition)},
+			{Name: new(grpcRuleName), Condition: new(grpcCondition)},
+			{Name: new(firstHTTPRuleName), Condition: new(httpCondition)},
+		}
+
+		sortRoutingRules(rules)
+
+		assert.Equal(t, []string{
+			grpcRuleName,
+			firstHTTPRuleName,
+			httpRuleName,
+			defaultCatchAllRuleName,
+		}, lo.Map(rules, func(rule loadbalancer.RoutingRule, _ int) string {
+			return lo.FromPtr(rule.Name)
+		}))
+	})
+
+	t.Run("is stable across input permutations", func(t *testing.T) {
+		fake := faker.New()
+		grpcCondition := "any(http.request.headers[(i 'content-type')][0] eq (i 'application/grpc'))"
+		httpCondition := "any(http.request.url.path sw '/')"
+		grpcRule := loadbalancer.RoutingRule{
+			Name:      new("p0003_" + fake.Numerify("########") + "_grpc"),
+			Condition: &grpcCondition,
+		}
+		firstHTTPRule := loadbalancer.RoutingRule{
+			Name:      new("p0001_" + fake.Numerify("########") + "_http"),
+			Condition: &httpCondition,
+		}
+		secondHTTPRule := loadbalancer.RoutingRule{
+			Name:      new("p0002_" + fake.Numerify("########") + "_http"),
+			Condition: &httpCondition,
+		}
+		defaultRule := defaultCatchAllRoutingRule("default-" + fake.Lorem().Word())
+		wantNames := []string{
+			lo.FromPtr(grpcRule.Name),
+			lo.FromPtr(firstHTTPRule.Name),
+			lo.FromPtr(secondHTTPRule.Name),
+			defaultCatchAllRuleName,
+		}
+
+		for _, rules := range [][]loadbalancer.RoutingRule{
+			{defaultRule, secondHTTPRule, grpcRule, firstHTTPRule},
+			{firstHTTPRule, grpcRule, defaultRule, secondHTTPRule},
+			{secondHTTPRule, firstHTTPRule, defaultRule, grpcRule},
+		} {
+			sortRoutingRules(rules)
+			assert.Equal(t, wantNames, lo.Map(rules, func(rule loadbalancer.RoutingRule, _ int) string {
+				return lo.FromPtr(rule.Name)
+			}))
+		}
+	})
+
+	t.Run("routing rule equality ignores order but detects semantic changes", func(t *testing.T) {
+		fake := faker.New()
+		firstRuleName := "p0001_" + fake.Numerify("########") + "_http"
+		secondRuleName := "p0002_" + fake.Numerify("########") + "_http"
+		firstCondition := "any(http.request.url.path sw '/" + fake.Lorem().Word() + "')"
+		secondCondition := "any(http.request.url.path sw '/" + fake.Lorem().Word() + "')"
+		firstBackendSet := "backend_" + fake.Numerify("########")
+		secondBackendSet := "backend_" + fake.Numerify("########")
+		firstRule := loadbalancer.RoutingRule{
+			Name:      new(firstRuleName),
+			Condition: new(firstCondition),
+			Actions: []loadbalancer.Action{loadbalancer.ForwardToBackendSet{
+				BackendSetName: new(firstBackendSet),
+			}},
+		}
+		secondRule := loadbalancer.RoutingRule{
+			Name:      new(secondRuleName),
+			Condition: new(secondCondition),
+			Actions: []loadbalancer.Action{loadbalancer.ForwardToBackendSet{
+				BackendSetName: new(secondBackendSet),
+			}},
+		}
+
+		assert.True(t, routingRulesEqual(
+			[]loadbalancer.RoutingRule{firstRule, secondRule},
+			[]loadbalancer.RoutingRule{secondRule, firstRule},
+		))
+
+		changedRule := firstRule
+		changedRule.Actions = []loadbalancer.Action{loadbalancer.ForwardToBackendSet{
+			BackendSetName: new(secondBackendSet),
+		}}
+		assert.False(t, routingRulesEqual(
+			[]loadbalancer.RoutingRule{firstRule, secondRule},
+			[]loadbalancer.RoutingRule{changedRule, secondRule},
+		))
+
+		changedRule = firstRule
+		changedRule.Condition = new("any(http.request.url.path sw '/" + fake.Lorem().Word() + "')")
+		assert.False(t, routingRulesEqual(
+			[]loadbalancer.RoutingRule{firstRule, secondRule},
+			[]loadbalancer.RoutingRule{changedRule, secondRule},
+		))
+
+		changedRule = firstRule
+		changedRule.Name = new("p0003_" + fake.Numerify("########") + "_http")
+		assert.False(t, routingRulesEqual(
+			[]loadbalancer.RoutingRule{firstRule, secondRule},
+			[]loadbalancer.RoutingRule{changedRule, secondRule},
+		))
+		assert.False(t, routingRulesEqual(
+			[]loadbalancer.RoutingRule{firstRule, secondRule},
+			[]loadbalancer.RoutingRule{firstRule},
+		))
 	})
 }
 
@@ -6519,6 +6975,36 @@ func Test_ociBackendSetNameFromBackendRef(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+
+	t.Run("keeps backend refs unique by namespace name and port", func(t *testing.T) {
+		fake := faker.New()
+		namespace := fake.Lorem().Word() + "-ns"
+		serviceName := fake.Internet().Slug() + "-svc"
+		firstPort := gatewayv1.PortNumber(fake.IntBetween(1024, 30000))
+		secondPort := firstPort + 1
+		httpRoute := makeRandomHTTPRoute(
+			randomHTTPRouteWithNamespaceOpt(namespace),
+		)
+		firstBackendRef := makeRandomBackendRef(func(br *gatewayv1.HTTPBackendRef) {
+			br.Name = gatewayv1.ObjectName(serviceName)
+			br.Namespace = nil
+			br.Port = &firstPort
+		})
+		secondBackendRef := makeRandomBackendRef(func(br *gatewayv1.HTTPBackendRef) {
+			br.Name = gatewayv1.ObjectName(serviceName)
+			br.Namespace = nil
+			br.Port = &secondPort
+		})
+
+		firstName := ociBackendSetNameFromBackendRef(httpRoute, firstBackendRef)
+		secondName := ociBackendSetNameFromBackendRef(httpRoute, secondBackendRef)
+
+		assert.Equal(t, firstName, ociBackendSetNameFromBackendRef(httpRoute, firstBackendRef))
+		assert.Equal(t, secondName, ociBackendSetNameFromBackendRef(httpRoute, secondBackendRef))
+		assert.NotEqual(t, firstName, secondName)
+		assert.LessOrEqual(t, len(firstName), maxBackendSetNameLength)
+		assert.LessOrEqual(t, len(secondName), maxBackendSetNameLength)
+	})
 }
 
 func Test_ociBackendSetNameFromService(t *testing.T) {

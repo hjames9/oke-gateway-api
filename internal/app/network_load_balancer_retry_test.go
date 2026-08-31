@@ -165,6 +165,201 @@ func TestNetworkLoadBalancerRetry(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("does not update backend set while network load balancer is updating", func(t *testing.T) {
+		fake := faker.New()
+		nlbID := "ocid1.networkloadbalancer.oc1.." + fake.UUID().V4()
+		backendSetName := "bs_" + fake.Lorem().Word()
+		ociClient := NewMockociNetworkLoadBalancerClient(t)
+		workRequestsWatcher := NewMockworkRequestsWatcher(t)
+
+		err := updateNetworkLoadBalancerBackendSet(
+			t.Context(),
+			ociClient,
+			workRequestsWatcher,
+			&networkloadbalancer.NetworkLoadBalancer{
+				Id:             &nlbID,
+				LifecycleState: networkloadbalancer.LifecycleStateUpdating,
+			},
+			backendSetName,
+			"update",
+			networkloadbalancer.UpdateBackendSetDetails{},
+		)
+
+		var busyErr *networkLoadBalancerBusyError
+		require.ErrorAs(t, err, &busyErr)
+		assert.Contains(t, err.Error(), nlbID)
+	})
+
+	t.Run("returns retryable error when backend set update races OCI creation visibility", func(t *testing.T) {
+		fake := faker.New()
+		nlbID := "ocid1.networkloadbalancer.oc1.." + fake.UUID().V4()
+		backendSetName := "bs_" + fake.Lorem().Word()
+		cause := ociapi.NewRandomServiceError(
+			ociapi.RandomServiceErrorWithStatusCode(http.StatusNotFound),
+			ociapi.RandomServiceErrorWithCode("NotAuthorizedOrNotFound"),
+			ociapi.RandomServiceErrorWithMessage("Unknown resource BackendSet "+backendSetName),
+		)
+		ociClient := NewMockociNetworkLoadBalancerClient(t)
+		workRequestsWatcher := NewMockworkRequestsWatcher(t)
+		ociClient.EXPECT().
+			UpdateBackendSet(t.Context(), mock.MatchedBy(func(request networkloadbalancer.UpdateBackendSetRequest) bool {
+				return lo.FromPtr(request.NetworkLoadBalancerId) == nlbID &&
+					lo.FromPtr(request.BackendSetName) == backendSetName
+			})).
+			Return(networkloadbalancer.UpdateBackendSetResponse{}, cause)
+
+		err := updateNetworkLoadBalancerBackendSet(
+			t.Context(),
+			ociClient,
+			workRequestsWatcher,
+			&networkloadbalancer.NetworkLoadBalancer{
+				Id:             &nlbID,
+				LifecycleState: networkloadbalancer.LifecycleStateActive,
+			},
+			backendSetName,
+			"update",
+			networkloadbalancer.UpdateBackendSetDetails{},
+		)
+
+		var busyErr *networkLoadBalancerBusyError
+		require.ErrorAs(t, err, &busyErr)
+		require.ErrorIs(t, err, cause)
+	})
+
+	t.Run("returns missing backend set update work request errors", func(t *testing.T) {
+		fake := faker.New()
+		nlbID := "ocid1.networkloadbalancer.oc1.." + fake.UUID().V4()
+		backendSetName := "bs_" + fake.Lorem().Word()
+		ociClient := NewMockociNetworkLoadBalancerClient(t)
+		workRequestsWatcher := NewMockworkRequestsWatcher(t)
+		ociClient.EXPECT().
+			UpdateBackendSet(t.Context(), mock.Anything).
+			Return(networkloadbalancer.UpdateBackendSetResponse{}, nil)
+
+		err := updateNetworkLoadBalancerBackendSet(
+			t.Context(),
+			ociClient,
+			workRequestsWatcher,
+			&networkloadbalancer.NetworkLoadBalancer{
+				Id:             &nlbID,
+				LifecycleState: networkloadbalancer.LifecycleStateActive,
+			},
+			backendSetName,
+			"update",
+			networkloadbalancer.UpdateBackendSetDetails{},
+		)
+
+		require.ErrorContains(t, err, "missing work request id")
+	})
+
+	t.Run("maps network load balancer backends by ip and port", func(t *testing.T) {
+		fake := faker.New()
+		ipAddress := fake.Internet().Ipv4()
+		port1 := fake.IntBetween(1024, 32767)
+		port2 := fake.IntBetween(32768, 65535)
+		backend1 := networkloadbalancer.Backend{
+			Name:      new(fmt.Sprintf("%s:%d", ipAddress, port1)),
+			IpAddress: &ipAddress,
+			Port:      &port1,
+		}
+		backend2 := networkloadbalancer.Backend{
+			Name:      new(fmt.Sprintf("%s:%d", ipAddress, port2)),
+			IpAddress: &ipAddress,
+			Port:      &port2,
+		}
+
+		result := mapNetworkLoadBalancerBackends([]networkloadbalancer.Backend{backend1, backend2})
+
+		assert.Equal(t, map[string]networkloadbalancer.Backend{
+			fmt.Sprintf("%s:%d", ipAddress, port1): backend1,
+			fmt.Sprintf("%s:%d", ipAddress, port2): backend2,
+		}, result)
+	})
+
+	t.Run("detects network load balancer backend option drift", func(t *testing.T) {
+		fake := faker.New()
+		backendName := fmt.Sprintf("%s:%d", fake.Internet().Ipv4(), fake.IntBetween(1024, 65535))
+		current := backendFromName(backendName, fake.IntBetween(1, 99))
+		desired := backendDetailsFromName(backendName, lo.FromPtr(current.Weight), lo.FromPtr(current.IsDrain))
+		desired.IsBackup = current.IsBackup
+		desired.IsOffline = current.IsOffline
+
+		assert.True(t, networkLoadBalancerBackendDetailsEqual(current, desired))
+
+		desired.Weight = new(lo.FromPtr(current.Weight) + 1)
+		assert.False(t, networkLoadBalancerBackendDetailsEqual(current, desired))
+
+		desired.Weight = current.Weight
+		desired.IsDrain = new(!lo.FromPtr(current.IsDrain))
+		assert.False(t, networkLoadBalancerBackendDetailsEqual(current, desired))
+
+		desired.IsDrain = current.IsDrain
+		desired.IsBackup = new(!lo.FromPtr(current.IsBackup))
+		assert.False(t, networkLoadBalancerBackendDetailsEqual(current, desired))
+
+		desired.IsBackup = current.IsBackup
+		desired.IsOffline = new(!lo.FromPtr(current.IsOffline))
+		assert.False(t, networkLoadBalancerBackendDetailsEqual(current, desired))
+	})
+
+	t.Run("wraps backend set update wait errors", func(t *testing.T) {
+		fake := faker.New()
+		nlbID := "ocid1.networkloadbalancer.oc1.." + fake.UUID().V4()
+		backendSetName := "bs_" + fake.Lorem().Word()
+		workRequestID := fake.UUID().V4()
+		wantErr := errors.New("wait failed")
+		ociClient := NewMockociNetworkLoadBalancerClient(t)
+		workRequestsWatcher := NewMockworkRequestsWatcher(t)
+		ociClient.EXPECT().
+			UpdateBackendSet(t.Context(), mock.Anything).
+			Return(networkloadbalancer.UpdateBackendSetResponse{OpcWorkRequestId: &workRequestID}, nil)
+		workRequestsWatcher.EXPECT().WaitFor(t.Context(), workRequestID).Return(wantErr)
+
+		err := updateNetworkLoadBalancerBackendSet(
+			t.Context(),
+			ociClient,
+			workRequestsWatcher,
+			&networkloadbalancer.NetworkLoadBalancer{
+				Id:             &nlbID,
+				LifecycleState: networkloadbalancer.LifecycleStateActive,
+			},
+			backendSetName,
+			"update",
+			networkloadbalancer.UpdateBackendSetDetails{},
+		)
+
+		require.ErrorIs(t, err, wantErr)
+		require.ErrorContains(t, err, "failed waiting for backend set")
+	})
+
+	t.Run("wraps non-retryable backend set update errors", func(t *testing.T) {
+		fake := faker.New()
+		nlbID := "ocid1.networkloadbalancer.oc1.." + fake.UUID().V4()
+		backendSetName := "bs_" + fake.Lorem().Word()
+		wantErr := errors.New("update failed")
+		ociClient := NewMockociNetworkLoadBalancerClient(t)
+		workRequestsWatcher := NewMockworkRequestsWatcher(t)
+		ociClient.EXPECT().
+			UpdateBackendSet(t.Context(), mock.Anything).
+			Return(networkloadbalancer.UpdateBackendSetResponse{}, wantErr)
+
+		err := updateNetworkLoadBalancerBackendSet(
+			t.Context(),
+			ociClient,
+			workRequestsWatcher,
+			&networkloadbalancer.NetworkLoadBalancer{
+				Id:             &nlbID,
+				LifecycleState: networkloadbalancer.LifecycleStateActive,
+			},
+			backendSetName,
+			"update",
+			networkloadbalancer.UpdateBackendSetDetails{},
+		)
+
+		require.ErrorIs(t, err, wantErr)
+		require.ErrorContains(t, err, "failed to update Network Load Balancer backend set")
+	})
+
 	t.Run("syncs backend member create update and delete", func(t *testing.T) {
 		fake := faker.New()
 		nlbID := "ocid1.networkloadbalancer.oc1.." + fake.UUID().V4()

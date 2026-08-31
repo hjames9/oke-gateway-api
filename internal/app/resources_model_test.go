@@ -1051,6 +1051,16 @@ func TestResourcesModelImpl_statusConditionsForRetry(t *testing.T) {
 		require.ErrorContains(t, err, "failed to resolve status conditions")
 	})
 
+	t.Run("returns error for mismatched GRPCRoute original type", func(t *testing.T) {
+		latest := &gatewayv1.GRPCRoute{ObjectMeta: metav1.ObjectMeta{Name: "route-" + fake.Lorem().Word()}}
+		original := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gateway-" + fake.Lorem().Word()}}
+
+		conditions, err := statusConditionsForRetry(latest, original, nil)
+
+		require.Nil(t, conditions)
+		require.ErrorContains(t, err, "failed to resolve status conditions")
+	})
+
 	t.Run("returns error when route parent is not found", func(t *testing.T) {
 		targetConditions := []metav1.Condition{{Type: string(gatewayv1.RouteConditionAccepted)}}
 		edgeParentName := gatewayv1.ObjectName("edge-" + fake.Lorem().Word())
@@ -1310,6 +1320,12 @@ func TestResourcesModelImpl_isConditionSet(t *testing.T) {
 		gatewayClass := newRandomResource(
 			randomResourceWithGeneration(generation),
 			randomResourceWithAnnotations(map[string]string{}),
+			randomResourceWithConditions(
+				newRandomConditions(
+					randomConditionWithType(conditionType),
+					randomConditionWithObservedGeneration(generation),
+				),
+			),
 		)
 		params := isConditionSetParams{
 			resource:      gatewayClass,
@@ -1333,6 +1349,12 @@ func TestResourcesModelImpl_isConditionSet(t *testing.T) {
 		gatewayClass := newRandomResource(
 			randomResourceWithGeneration(generation),
 			randomResourceWithAnnotations(map[string]string{key: fake.Lorem().Sentence(10)}),
+			randomResourceWithConditions(
+				newRandomConditions(
+					randomConditionWithType(conditionType),
+					randomConditionWithObservedGeneration(generation),
+				),
+			),
 		)
 		params := isConditionSetParams{
 			resource:      gatewayClass,
