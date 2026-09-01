@@ -16,7 +16,14 @@
     "noop": false
   },
   "ociapi": {
-    "noop": false
+    "noop": false,
+    "retry": {
+      "enabled": true,
+      "max-attempts": 8,
+      "max-sleep": "30s"
+    },
+    "max-concurrent-requests": 4,
+    "max-concurrent-mutating-requests": 1
   },
   "reconcile": {
     "drift-interval": "0s"
