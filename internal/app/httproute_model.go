@@ -326,8 +326,10 @@ func makeTargetOnlyParentRef(parentRef gatewayv1.ParentReference) gatewayv1.Pare
 }
 
 func l7RouteConflictingWinner(params l7RouteConflictParams) (l7RouteCandidate, bool) {
+	var winner l7RouteCandidate
+	found := false
 	for _, oppositeRoute := range params.oppositeRoutes {
-		if params.current.identity.kind != oppositeRoute.identity.kind {
+		if params.current.identity.kind == oppositeRoute.identity.kind {
 			continue
 		}
 		if !l7RoutesShareListenerHostname(
@@ -340,10 +342,13 @@ func l7RouteConflictingWinner(params l7RouteConflictParams) (l7RouteCandidate, b
 			continue
 		}
 		if l7RouteWins(oppositeRoute.identity, params.current.identity) {
-			return oppositeRoute, true
+			if !found || l7RouteWins(oppositeRoute.identity, winner.identity) {
+				winner = oppositeRoute
+				found = true
+			}
 		}
 	}
-	return l7RouteCandidate{}, false
+	return winner, found
 }
 
 func checkL7RouteConflict(ctx context.Context, params checkL7RouteConflictParams) (l7RouteCandidate, bool, error) {
@@ -1029,7 +1034,9 @@ func (m *httpRouteModelImpl) acceptRoute(
 			hostnames:  routeDetails.httpRoute.Spec.Hostnames,
 		},
 		oppositeRouteListName: "GRPCRoutes",
-		listOppositeRoutes:    m.listGRPCRouteConflictCandidates,
+		listOppositeRoutes: func(ctx context.Context) ([]l7RouteCandidate, error) {
+			return m.listGRPCRouteConflictCandidates(ctx)
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -1099,7 +1106,34 @@ func (m *httpRouteModelImpl) acceptRoute(
 	return httpRoute, nil
 }
 
-func (m *httpRouteModelImpl) listGRPCRouteConflictCandidates(ctx context.Context) ([]l7RouteCandidate, error) {
+func (m *httpRouteModelImpl) listHTTPRouteConflictCandidates(
+	ctx context.Context,
+	current gatewayv1.HTTPRoute,
+) ([]l7RouteCandidate, error) {
+	var httpRoutes gatewayv1.HTTPRouteList
+	if err := m.client.List(ctx, &httpRoutes); err != nil {
+		return nil, err
+	}
+	return lo.FilterMap(httpRoutes.Items, func(route gatewayv1.HTTPRoute, _ int) (l7RouteCandidate, bool) {
+		if route.DeletionTimestamp != nil || route.Namespace == current.Namespace && route.Name == current.Name {
+			return l7RouteCandidate{}, false
+		}
+		return l7RouteCandidate{
+			identity: l7RouteIdentity{
+				kind:              l7HTTPRouteKind,
+				namespace:         route.Namespace,
+				name:              route.Name,
+				creationTimestamp: route.CreationTimestamp,
+			},
+			parentRefs: route.Spec.ParentRefs,
+			hostnames:  route.Spec.Hostnames,
+		}, true
+	}), nil
+}
+
+func (m *httpRouteModelImpl) listGRPCRouteConflictCandidates(
+	ctx context.Context,
+) ([]l7RouteCandidate, error) {
 	var grpcRoutes gatewayv1.GRPCRouteList
 	if err := m.client.List(ctx, &grpcRoutes); err != nil {
 		return nil, err
