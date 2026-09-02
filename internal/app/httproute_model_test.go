@@ -488,6 +488,54 @@ func TestHTTPRouteModelImpl(t *testing.T) {
 		assert.False(t, conflicted)
 		assert.Empty(t, winner)
 
+		for _, tc := range []struct {
+			name      string
+			kindA     l7RouteKind
+			kindB     l7RouteKind
+			wantShare bool
+		}{
+			{
+				name:      "http and grpc routes can share a listener",
+				kindA:     l7HTTPRouteKind,
+				kindB:     l7GRPCRouteKind,
+				wantShare: true,
+			},
+			{
+				name:      "grpc and http routes can share a listener",
+				kindA:     l7GRPCRouteKind,
+				kindB:     l7HTTPRouteKind,
+				wantShare: true,
+			},
+			{
+				name:      "http routes are not whole-route shareable with each other",
+				kindA:     l7HTTPRouteKind,
+				kindB:     l7HTTPRouteKind,
+				wantShare: false,
+			},
+			{
+				name:      "grpc routes are not whole-route shareable with each other",
+				kindA:     l7GRPCRouteKind,
+				kindB:     l7GRPCRouteKind,
+				wantShare: false,
+			},
+			{
+				name:      "unknown route kinds are not shareable with http routes",
+				kindA:     l7RouteKind("UnsupportedL7Route"),
+				kindB:     l7HTTPRouteKind,
+				wantShare: false,
+			},
+			{
+				name:      "unknown route kinds are not shareable with grpc routes",
+				kindA:     l7RouteKind("UnsupportedL7Route"),
+				kindB:     l7GRPCRouteKind,
+				wantShare: false,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				assert.Equal(t, tc.wantShare, l7RouteKindsCanShareListener(tc.kindA, tc.kindB))
+			})
+		}
+
 		olderOpposite.identity.kind = l7HTTPRouteKind
 		winner, conflicted, err = checkL7RouteConflict(t.Context(), checkL7RouteConflictParams{
 			gateway:               gateway,
@@ -598,7 +646,7 @@ func TestHTTPRouteModelImpl(t *testing.T) {
 			olderOpposite,
 		))
 		disjointHostnameRoute := olderOpposite
-		disjointHostnameRoute.identity.kind = l7GRPCRouteKind
+		disjointHostnameRoute.identity.kind = l7RouteKind("UnsupportedL7Route")
 		disjointHostnameRoute.hostnames = []gatewayv1.Hostname{"web.example.com"}
 		assert.False(t, l7RoutesShareListenerHostname(
 			gateway,
@@ -608,7 +656,7 @@ func TestHTTPRouteModelImpl(t *testing.T) {
 			disjointHostnameRoute,
 		))
 		unsharedListenerRoute := olderOpposite
-		unsharedListenerRoute.identity.kind = l7GRPCRouteKind
+		unsharedListenerRoute.identity.kind = l7RouteKind("UnsupportedL7Route")
 		unsharedListenerRoute.parentRefs = []gatewayv1.ParentReference{{
 			Namespace:   &parentNamespace,
 			Name:        gatewayv1.ObjectName(gateway.Name),
@@ -1995,6 +2043,40 @@ func TestHTTPRouteModelImpl(t *testing.T) {
 		require.Len(t, got, 1)
 		assert.Equal(t, l7RouteIdentity{
 			kind:              l7HTTPRouteKind,
+			namespace:         activeRoute.Namespace,
+			name:              activeRoute.Name,
+			creationTimestamp: activeRoute.CreationTimestamp,
+		}, got[0].identity)
+		assert.Equal(t, activeRoute.Spec.ParentRefs, got[0].parentRefs)
+		assert.Equal(t, activeRoute.Spec.Hostnames, got[0].hostnames)
+	})
+
+	t.Run("listGRPCRouteConflictCandidates", func(t *testing.T) {
+		deps := newMockDeps(t)
+		model := newHTTPRouteModel(deps)
+		k8sClient, _ := deps.K8sClient.(*Mockk8sClient)
+		deletionTimestamp := metav1.Now()
+		activeRoute := makeRandomGRPCRoute()
+		activeRoute.Spec.ParentRefs = []gatewayv1.ParentReference{makeRandomParentRef()}
+		activeRoute.Spec.Hostnames = []gatewayv1.Hostname{"api.example.com"}
+		deletedRoute := makeRandomGRPCRoute()
+		deletedRoute.DeletionTimestamp = &deletionTimestamp
+
+		k8sClient.EXPECT().List(t.Context(), &gatewayv1.GRPCRouteList{}).
+			RunAndReturn(func(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
+				list.(*gatewayv1.GRPCRouteList).Items = []gatewayv1.GRPCRoute{
+					activeRoute,
+					deletedRoute,
+				}
+				return nil
+			})
+
+		got, err := model.listGRPCRouteConflictCandidates(t.Context())
+
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, l7RouteIdentity{
+			kind:              l7GRPCRouteKind,
 			namespace:         activeRoute.Namespace,
 			name:              activeRoute.Name,
 			creationTimestamp: activeRoute.CreationTimestamp,
