@@ -79,7 +79,7 @@ func TestClients(t *testing.T) {
 		require.NoError(t, clientErr)
 		require.NotNil(t, client.RetryPolicy())
 		assert.Equal(t, uint(5), client.RetryPolicy().MaximumNumberAttempts)
-		assert.InDelta(t, 7, client.RetryPolicy().MaxSleepBetween, 0)
+		assert.InDelta(t, deps.RetryMaxSleep.Seconds(), client.RetryPolicy().MaxSleepBetween, 0)
 	})
 
 	t.Run("creates network load balancer client with retry policy", func(t *testing.T) {
@@ -88,7 +88,7 @@ func TestClients(t *testing.T) {
 		require.NoError(t, clientErr)
 		require.NotNil(t, client.RetryPolicy())
 		assert.Equal(t, uint(5), client.RetryPolicy().MaximumNumberAttempts)
-		assert.InDelta(t, 7, client.RetryPolicy().MaxSleepBetween, 0)
+		assert.InDelta(t, deps.RetryMaxSleep.Seconds(), client.RetryPolicy().MaxSleepBetween, 0)
 	})
 
 	t.Run("creates certificates management client with retry policy", func(t *testing.T) {
@@ -97,7 +97,7 @@ func TestClients(t *testing.T) {
 		require.NoError(t, clientErr)
 		require.NotNil(t, client.RetryPolicy())
 		assert.Equal(t, uint(5), client.RetryPolicy().MaximumNumberAttempts)
-		assert.InDelta(t, 7, client.RetryPolicy().MaxSleepBetween, 0)
+		assert.InDelta(t, deps.RetryMaxSleep.Seconds(), client.RetryPolicy().MaxSleepBetween, 0)
 	})
 
 	t.Run("creates clients without custom retry policy when disabled", func(t *testing.T) {
@@ -156,7 +156,7 @@ func TestOCIRetryPolicy(t *testing.T) {
 
 		assert.True(t, shouldRetry)
 		assert.Equal(t, uint(5), policy.MaximumNumberAttempts)
-		assert.InDelta(t, 7, policy.MaxSleepBetween, 0)
+		assert.InDelta(t, (7 * time.Second).Seconds(), policy.MaxSleepBetween, 0)
 	})
 
 	t.Run("retries transient OCI server errors", func(t *testing.T) {
